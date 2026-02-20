@@ -1,13 +1,11 @@
-this is sample of code is to test the yolov8_pest_detection we have
+this project is to test the yolov8_pest_detection we have that runs on RF-DETR (Nano) architecture
 
-it runs on RF-DETR (Nano) architecture
-
-this project uses UV as package manager instead of PIP so make sure to install UV first:
+this project uses UV as package manager instead of PIP make sure to install UV first:
 - uv (https://docs.astral.sh/uv/getting-started/installation/)
 - you need to run `uv sync` to install dependencies and create a virtual environment
 - then to run the project `uv python main.py` 
 
-before running code this make sure first to:
+**BUT before running thos code make sure first to**:
 - download the weights from roboflow platform
 - download sample images for testing
 - create .env file with for weights, sample images and output path's
