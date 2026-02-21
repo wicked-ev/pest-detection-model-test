@@ -14,7 +14,7 @@ weights_path = os.getenv("WEIGHTS_PATH")
 output_save = os.getenv("OUTPUT_SAVE_PATH")
 image_sample_path = os.path.join(
     os.getenv("SAMPLE_TEST_PATH"),
-    "ash_weevil_1_png.rf.0ew1zPLftH35OBJJH3ZQ.jpg",
+    "ash_weevil_2_png.rf.hZxgta7G4n8alrNt0cnu.jpg",
 )
 
 
@@ -29,7 +29,12 @@ def main():
     annotated_image = sv.BoxAnnotator().annotate(image, detections)
     annotated_image = sv.LabelAnnotator().annotate(annotated_image, detections, labels)
     annotated_image.show()
-    annotated_image.save(os.path.join(output_save, "output.jpg"))
+    file_count = sum(
+        1
+        for item in os.listdir(output_save)
+        if os.path.isfile(os.path.join(output_save, item))
+    )
+    annotated_image.save(os.path.join(output_save, f"output{file_count + 1}.jpg"))
 
 
 if __name__ == "__main__":
