@@ -5,7 +5,7 @@ this project uses UV as package manager instead of PIP make sure to install UV f
 - you need to run `uv sync` to install dependencies and create a virtual environment
 - then to run the project `uv python main.py` 
 
-**BUT before running thos code make sure first to**:
+**BUT before running this code make sure first to**:
 - download the weights from roboflow platform
 - download sample images for testing
 - create .env file with for weights, sample images and output path's
