@@ -1335,6 +1335,7 @@ name = "thesis-playground"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "opencv-python" },
     { name = "python-dotenv" },
     { name = "requests" },
     { name = "rfdetr" },
@@ -1343,6 +1344,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "opencv-python", specifier = ">=4.13.0.92" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "rfdetr", specifier = ">=1.4.3" },
