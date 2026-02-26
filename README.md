@@ -3,7 +3,10 @@ this project is to test the yolov8_pest_detection we have that runs on RF-DETR (
 this project uses UV as package manager instead of PIP make sure to install UV first:
 - uv (https://docs.astral.sh/uv/getting-started/installation/)
 - you need to run `uv sync` to install dependencies and create a virtual environment
-- then to run the project `uv python main.py` 
+- to run the code `uv python main.py` this will run the model on image detection
+- to run the model on video detection use the flag `-v`, `uv python main.py -v`
+- and for video stream `uv python main.py -s`
+- make sure to setup the video path/links in your .env file before running
 
 **BUT before running this code make sure first to**:
 - download the weights from roboflow platform
