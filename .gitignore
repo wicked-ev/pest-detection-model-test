@@ -7,8 +7,8 @@ wheels/
 *.egg-info
 annotated_image_output/
 image_sample/
+videos/
 wieghts/
 # Virtual environments
 .venv
 .env
-
