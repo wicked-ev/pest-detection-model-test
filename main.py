@@ -3,6 +3,7 @@ import sys
 import time
 import threading
 import queue
+import json
 import cv2
 import numpy as np
 import supervision as sv
@@ -15,11 +16,29 @@ from rfdetr.util.coco_classes import COCO_CLASSES
 # Make sure to download the weights and image samples from the dataset for testing
 load_dotenv()
 
+def load_dataset_classes(annotations_path: str) -> dict[int,str]:
+    """
+       Load class ID → class name mapping from a COCO-format annotations file.
+       Roboflow exports categories sorted by ID, but we sort explicitly to be safe.
+       """
+    with open(annotations_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
+   
+    if "categories" not in coco:
+        raise KeyError("No 'categories' key found in annotations file — is this a valid COCO JSON?")
+   
+       # Build {id: name} dict sorted by ID so index lookups are always correct
+    return {cat["id"]: cat["name"] for cat in sorted(coco["categories"], key=lambda c: c["id"])}
+
+
 OUTPUT_SAVE_PATH = os.getenv("OUTPUT_SAVE_PATH")
 SAMPLE_TEST_PATH = os.getenv("SAMPLE_TEST_PATH")
 WEIGHTS_PATH     = os.getenv("WEIGHTS_PATH")
+ANNOTATIONS_PATH = os.getenv("ANNOTATIONS_PATH")
+DATASET_CLASSES  = load_dataset_classes(ANNOTATIONS_PATH)
+NUM_CLASSES      = len(DATASET_CLASSES)
 
-# --- Pi 3 B+ tuning knobs ---
+# --- Pi 3 B+ tuning
 # Inference input size: smaller = faster, less accurate
 INFERENCE_WIDTH  = 320
 INFERENCE_HEIGHT = 320
@@ -35,7 +54,10 @@ def _get_labels(detections):
     COCO_CLASSES is 0-indexed, so class_id maps directly — no offset needed.
     (The +1 offset in the original videoDetection was the source of wrong labels.)
     """
-    return [COCO_CLASSES[int(cid)] for cid in detections.class_id]
+    return [
+        f"{DATASET_CLASSES[int(cid)]} {score:.2f}"
+        for cid, score in zip(detections.class_id, detections.confidence)
+    ]
 
 
 def _resize_for_inference(frame_bgr):
@@ -56,7 +78,7 @@ def imageDetection(model):
     """Run detection on a single test image, display and save the annotated result."""
     image_path = os.path.join(
         SAMPLE_TEST_PATH,
-        "ash_weevil_2_png.rf.hZxgta7G4n8alrNt0cnu.jpg",
+        "Pieris_291_png.rf.oqcuwGTkXD4TbkNoczUY.png",
     )
 
     image = None  # defined before try so finally is always safe
@@ -126,7 +148,7 @@ def videoDetection(model, video_path):
 
     capture_thread = threading.Thread(target=_capture_loop, daemon=True)
     capture_thread.start()
-    # -----------------------------------------------------------------------
+    
 
     box_annotator   = sv.BoxAnnotator()
     label_annotator = sv.LabelAnnotator()
@@ -166,7 +188,7 @@ def videoDetection(model, video_path):
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-            # Soft FPS cap — sleep only if we finished faster than the target
+            # Soft FPS cap sleep only if we finished faster than the target
             elapsed = time.monotonic() - loop_start
             sleep_for = frame_interval - elapsed
             if sleep_for > 0:
@@ -182,7 +204,8 @@ def videoDetection(model, video_path):
 
 def main():
     # Load model once; optimize_for_inference() applies ONNX / int8 optimizations
-    model = RFDETRNano(pretrain_weights=WEIGHTS_PATH)
+    print(f"Loaded {NUM_CLASSES} classes: {list(DATASET_CLASSES.values())}")
+    model = RFDETRNano(pretrain_weights=WEIGHTS_PATH, num_classes=NUM_CLASSES)
     model.optimize_for_inference()
 
     path_map = {
