@@ -101,6 +101,7 @@ class RobotApplication:
         
         logger.info("✓ Application initialized")
 
+        
     def startup(self) -> bool:
         """
         Execute startup sequence.
@@ -163,7 +164,7 @@ class RobotApplication:
                 )
                 self._is_running = True
                 logger.info("Hotspot mode enabled; waiting for WiFi credentials")
-                return True
+                
             
             logger.info("✓ WiFi connection established")
             
@@ -171,6 +172,7 @@ class RobotApplication:
             logger.info("\n[3/5] PHASE: SERVER CONNECTION")
             logger.info("-" * 70)
             
+
             if not self.state_machine.transition_to(
                 RobotState.SERVER_CONNECTING,
                 reason="Connecting to remote control server"
@@ -251,7 +253,7 @@ class RobotApplication:
                 self._handle_check_failure(result)
                 return False
             
-            # Check 3: Camera
+            # Check 3: Camera 
             logger.info("\nCheck 3: Camera System")
             result = self.health_service.check_camera(
                 camera_available_fn=self.camera_service.is_available
@@ -259,6 +261,11 @@ class RobotApplication:
             if result.status == HealthCheckStatus.ERROR:
                 logger.warning(f"⚠ Camera check failed: {result.message}")
                 # Camera failure is not critical, continue
+            
+            
+            # Model RFDTRNano -> ARM CPU PI -> Export ONNX  
+            # test desktop
+            # test PI?
             
             # Check 4: AI Model
             logger.info("\nCheck 4: AI Detection Model")
@@ -269,6 +276,7 @@ class RobotApplication:
             if result.status == HealthCheckStatus.ERROR:
                 logger.warning(f"⚠ Model check failed: {result.message}")
                 # Model failure is not critical, continue
+            
             
             # Verify all critical checks passed
             if not self.health_service.is_all_healthy():
