@@ -43,7 +43,7 @@ CONFIG_DIR.mkdir(exist_ok=True)
 # Linux/Raspberry Pi: "/dev/ttyACM0", "/dev/ttyUSB0"
 # macOS: "/dev/tty.usbmodem14101" (varies by device)
 # Windows: "COM3", "COM4" (varies by device)
-ARDUINO_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyACM0")
+ARDUINO_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")
 
 # Serial communication speed (must match Arduino sketch)
 ARDUINO_BAUDRATE = int(os.getenv("ARDUINO_BAUDRATE", 9600))

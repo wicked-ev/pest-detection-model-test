@@ -33,15 +33,34 @@ class MovementDirection(Enum):
     STOP = "stop"
 
 
+class MotorID(Enum):
+    """Individual motor identifiers."""
+    MOTOR_0 = 0
+    MOTOR_1 = 1
+    MOTOR_2 = 2
+    MOTOR_3 = 3
+
+
 @dataclass
 class MotorStatus:
     """Current status of motor system."""
     is_healthy: bool
     is_moving: bool
-    left_speed: int  # 0-255
-    right_speed: int  # 0-255
-    battery_voltage: float
-    temperature: float
+    
+    # Individual motor speeds and directions (0-255)
+    motor_0_speed: int
+    motor_0_direction: int
+    motor_1_speed: int
+    motor_1_direction: int
+    motor_2_speed: int
+    motor_2_direction: int
+    motor_3_speed: int
+    motor_3_direction: int
+    
+    # Pump motor
+    pump_speed: int
+    pump_direction: int
+    
     last_command: Optional[MovementDirection] = None
     timestamp: float = 0.0
 
@@ -93,7 +112,10 @@ class MotorController:
             # Ensure motors are stopped
             if not self.stop():
                 logger.error("Failed to stop motors during init")
+                self._is_healthy = False
                 return False
+
+            self._current_direction = MovementDirection.STOP
 
             # Check motor health
             if not self._arduino.check_motors():
@@ -140,8 +162,9 @@ class MotorController:
             logger.error("Cannot move: Arduino not connected")
             return False
 
-        if not self._is_healthy:
-            logger.warning("Motors are not healthy, attempting move anyway")
+        if direction != MovementDirection.STOP and not self._is_healthy:
+            logger.error("Cannot move: motor system is unhealthy")
+            return False
 
         try:
             success = self._arduino.move(direction.value)
@@ -152,13 +175,16 @@ class MotorController:
                 logger.info(f"Move command: {direction.value}")
             else:
                 logger.warning(f"Move command failed: {direction.value}")
-                self._current_direction = None
+                if direction != MovementDirection.STOP:
+                    self._current_direction = MovementDirection.STOP
+                else:
+                    self._current_direction = None
 
             return success
 
         except Exception as e:
             logger.error(f"Move operation failed: {e}")
-            self._current_direction = None
+            self._current_direction = MovementDirection.STOP
             return False
 
     def stop(self) -> bool:
@@ -171,7 +197,13 @@ class MotorController:
             True if stop command sent
         """
         logger.info("STOP command")
-        return self.move(MovementDirection.STOP)
+        success = self._arduino.stop_all()
+        if success:
+            self._current_direction = MovementDirection.STOP
+            self._last_movement_time = time.time()
+        else:
+            logger.error("Emergency stop failed")
+        return success
 
     def get_current_direction(self) -> Optional[MovementDirection]:
         """Get the last commanded direction."""
@@ -191,15 +223,26 @@ class MotorController:
                 logger.warning("Failed to get hardware status from Arduino")
                 return None
 
+            # Check if any motor is moving
+            any_moving = (hardware_status.motor_0_speed > 0 or
+                         hardware_status.motor_1_speed > 0 or
+                         hardware_status.motor_2_speed > 0 or
+                         hardware_status.motor_3_speed > 0)
+
             # Convert HardwareStatus to MotorStatus
             motor_status = MotorStatus(
                 is_healthy=hardware_status.motors_ok,
-                is_moving=(self._current_direction is not None
-                          and self._current_direction != MovementDirection.STOP),
-                left_speed=hardware_status.motor_left_speed,
-                right_speed=hardware_status.motor_right_speed,
-                battery_voltage=hardware_status.battery_voltage,
-                temperature=hardware_status.temperature,
+                is_moving=any_moving,
+                motor_0_speed=hardware_status.motor_0_speed,
+                motor_0_direction=hardware_status.motor_0_direction,
+                motor_1_speed=hardware_status.motor_1_speed,
+                motor_1_direction=hardware_status.motor_1_direction,
+                motor_2_speed=hardware_status.motor_2_speed,
+                motor_2_direction=hardware_status.motor_2_direction,
+                motor_3_speed=hardware_status.motor_3_speed,
+                motor_3_direction=hardware_status.motor_3_direction,
+                pump_speed=hardware_status.pump_speed,
+                pump_direction=hardware_status.pump_direction,
                 last_command=self._current_direction,
                 timestamp=hardware_status.timestamp,
             )
@@ -243,10 +286,13 @@ class MotorController:
             if status is None:
                 return False
             
-            # Check if moving with expected speed
-            if (status.is_moving and 
-                status.left_speed >= expected_speed and 
-                status.right_speed >= expected_speed):
+            # Check if all motors are moving with expected speed
+            all_moving = (status.motor_0_speed >= expected_speed and
+                         status.motor_1_speed >= expected_speed and
+                         status.motor_2_speed >= expected_speed and
+                         status.motor_3_speed >= expected_speed)
+            
+            if status.is_moving and all_moving:
                 logger.debug(f"Movement verified: {direction.value}")
                 return True
             
@@ -258,6 +304,85 @@ class MotorController:
     def get_last_status(self) -> Optional[MotorStatus]:
         """Get the last queried status without querying again."""
         return self._last_status
+
+    def set_motor(self, motor_id: int, speed: int, direction: int) -> bool:
+        """
+        Set speed and direction for a specific motor.
+        
+        Args:
+            motor_id: 0-3 (motor identifier)
+            speed: 0-255 (PWM speed)
+            direction: 0 (backward) or 1 (forward)
+            
+        Returns:
+            True if command sent successfully
+        """
+        if motor_id < 0 or motor_id > 3:
+            logger.error(f"Invalid motor ID: {motor_id}")
+            return False
+
+        if not self._arduino.is_connected():
+            logger.error("Cannot set motor: Arduino not connected")
+            return False
+
+        try:
+            success = self._arduino.set_motor(motor_id, speed, direction)
+            if success:
+                logger.info(f"Motor {motor_id} set to speed {speed}, direction {direction}")
+            else:
+                logger.warning(f"Failed to set motor {motor_id}")
+            return success
+        except Exception as e:
+            logger.error(f"Set motor {motor_id} failed: {e}")
+            return False
+
+    def set_pump(self, speed: int, direction: int) -> bool:
+        """
+        Set speed and direction for the pump motor.
+        
+        Args:
+            speed: 0-255 (PWM speed)
+            direction: 0 (backward/off) or 1 (forward/on)
+            
+        Returns:
+            True if command sent successfully
+        """
+        if not self._arduino.is_connected():
+            logger.error("Cannot set pump: Arduino not connected")
+            return False
+
+        try:
+            success = self._arduino.set_pump(speed, direction)
+            if success:
+                logger.info(f"Pump set to speed {speed}, direction {direction}")
+            else:
+                logger.warning("Failed to set pump")
+            return success
+        except Exception as e:
+            logger.error(f"Set pump failed: {e}")
+            return False
+
+    def get_motor_speed(self, motor_id: int) -> Optional[int]:
+        """Get the last reported speed for a specific motor (0-255)."""
+        if self._last_status is None:
+            return None
+        
+        if motor_id == 0:
+            return self._last_status.motor_0_speed
+        elif motor_id == 1:
+            return self._last_status.motor_1_speed
+        elif motor_id == 2:
+            return self._last_status.motor_2_speed
+        elif motor_id == 3:
+            return self._last_status.motor_3_speed
+        else:
+            return None
+
+    def get_pump_speed(self) -> Optional[int]:
+        """Get the last reported pump speed (0-255)."""
+        if self._last_status is None:
+            return None
+        return self._last_status.pump_speed
 
     def reset_health_check(self) -> bool:
         """
@@ -276,12 +401,19 @@ class MotorController:
             return False
 
         if self._arduino.check_motors():
-            self._is_healthy = True
-            logger.info("✓ Motor health verified after reset")
-            return True
-        else:
-            logger.error("Motor health check failed during reset")
-            return False
+            status = self.get_status()
+            if status and status.is_healthy:
+                self._is_healthy = True
+                logger.info("✓ Motor health verified after reset")
+                return True
+
+        logger.error("Motor health check failed during reset")
+        return False
+
+    def shutdown(self) -> None:
+        """Stop the motors and release any motor resources."""
+        if self._arduino.is_connected():
+            self.stop()
 
 
 class MotorInitializationError(Exception):

@@ -23,7 +23,7 @@ from typing import Optional, Sequence
 from enum import Enum
 from dataclasses import dataclass
 from threading import Lock, Thread
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +32,11 @@ class ArduinoCommand(Enum):
     """Commands sent to Arduino."""
     PING = "PING"
     CHECK = "CHECK"
-    MOVE_FORWARD = "MOVE_FORWARD"
-    MOVE_BACKWARD = "MOVE_BACKWARD"
-    MOVE_LEFT = "MOVE_LEFT"
-    MOVE_RIGHT = "MOVE_RIGHT"
     STOP = "STOP"
+    STOP_ALL = "STOP_ALL"
     GET_STATUS = "GET_STATUS"
+    SET_MOTOR = "SET_MOTOR"  # Parameterized: SET_MOTOR <id> <speed> <direction>
+    SET_PUMP = "SET_PUMP"    # Parameterized: SET_PUMP <speed> <direction>
 
 
 class ArduinoResponse(Enum):
@@ -54,10 +53,16 @@ class ArduinoResponse(Enum):
 class HardwareStatus:
     """Status report from Arduino."""
     motors_ok: bool
-    motor_left_speed: int  # 0-255
-    motor_right_speed: int  # 0-255
-    battery_voltage: float
-    temperature: float
+    motor_0_speed: int      # 0-255
+    motor_0_direction: int  # 0 or 1
+    motor_1_speed: int      # 0-255
+    motor_1_direction: int  # 0 or 1
+    motor_2_speed: int      # 0-255
+    motor_2_direction: int  # 0 or 1
+    motor_3_speed: int      # 0-255
+    motor_3_direction: int  # 0 or 1
+    pump_speed: int         # 0-255
+    pump_direction: int     # 0 or 1
     timestamp: float
 
 
@@ -83,11 +88,12 @@ class ArduinoConnection:
 
     def __init__(
         self,
-        port: str = "/dev/ttyACM0",  # Arduino serial port on Raspberry Pi
+        port: str = "/dev/ttyUSB0",  # Arduino serial port on Raspberry Pi
         baudrate: int = 9600,
         timeout: float = 2.0,
         write_timeout: float = 2.0,
-        max_reconnect_attempts: int = 3,
+        read_timeout: float = 0.1,
+        max_reconnect_attempts: int = 10,
         reconnect_delay: float = 1.0,
     ):
         """
@@ -105,26 +111,26 @@ class ArduinoConnection:
         self.baudrate = baudrate
         self.timeout = timeout
         self.write_timeout = write_timeout
+        self._read_timeout = read_timeout
         self.max_reconnect_attempts = max_reconnect_attempts
         self.reconnect_delay = reconnect_delay
 
         self._serial: Optional[serial.Serial] = None
         self._connection_lock = Lock()
         self._is_connected = False
-        self._response_queue: Queue[str] = Queue()
+        self._response_queue: Queue[str] = Queue(maxsize=100)
         self._reader_thread: Optional[Thread] = None
         self._stop_reader = False
 
     def _expected_responses_for(self, command: ArduinoCommand) -> Sequence[str]:
         """Return acceptable response strings for a given command."""
         mapping = {
-            ArduinoCommand.PING: [ArduinoResponse.PING_RESPONSE.value, ArduinoResponse.OK.value],
-            ArduinoCommand.CHECK: [ArduinoResponse.MOTORS_OK.value, ArduinoResponse.OK.value],
-            ArduinoCommand.MOVE_FORWARD: [ArduinoResponse.OK.value],
-            ArduinoCommand.MOVE_BACKWARD: [ArduinoResponse.OK.value],
-            ArduinoCommand.MOVE_LEFT: [ArduinoResponse.OK.value],
-            ArduinoCommand.MOVE_RIGHT: [ArduinoResponse.OK.value],
+            ArduinoCommand.PING: [ArduinoResponse.PING_RESPONSE.value],
+            ArduinoCommand.CHECK: [ArduinoResponse.MOTORS_OK.value],
             ArduinoCommand.STOP: [ArduinoResponse.OK.value],
+            ArduinoCommand.STOP_ALL: [ArduinoResponse.OK.value],
+            ArduinoCommand.SET_MOTOR: [ArduinoResponse.OK.value],
+            ArduinoCommand.SET_PUMP: [ArduinoResponse.OK.value],
         }
         return mapping.get(command, [ArduinoResponse.OK.value])
 
@@ -132,7 +138,7 @@ class ArduinoConnection:
         """
         Establish connection to Arduino.
         
-        Implements retry logic with exponential backoff.
+        Implements retry logic with delay and clears stale serial data.
         
         Returns:
             True if connected, False if all attempts failed
@@ -144,23 +150,26 @@ class ArduinoConnection:
                         f"Connecting to Arduino on {self.port} "
                         f"(attempt {attempt + 1}/{self.max_reconnect_attempts})"
                     )
-                    
+
+                    self._response_queue = Queue(maxsize=100)
                     self._serial = serial.Serial(
                         port=self.port,
                         baudrate=self.baudrate,
-                        timeout=self.timeout,
+                        timeout=self._read_timeout,
                         write_timeout=self.write_timeout,
                     )
-                    
-                    # Give Arduino time to reset and initialize
-                    time.sleep(2.0)
-                    
+
+                    # Give Arduino time to reset and settle before use
+                    time.sleep(3.0)
+                    self._serial.reset_input_buffer()
+                    self._serial.reset_output_buffer()
+
                     self._is_connected = True
                     logger.info(f"✓ Connected to Arduino on {self.port}")
-                    
+
                     # Start background reader thread
                     self._start_reader_thread()
-                    
+
                     return True
 
             except (serial.SerialException, OSError) as e:
@@ -183,19 +192,68 @@ class ArduinoConnection:
         """Safely disconnect from Arduino."""
         with self._connection_lock:
             self._stop_reader = True
-            
-            if self._reader_thread and self._reader_thread.is_alive():
-                self._reader_thread.join(timeout=2.0)
-            
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
+
+        with self._connection_lock:
             if self._serial and self._serial.is_open:
+                try:
+                    self._serial.reset_input_buffer()
+                    self._serial.reset_output_buffer()
+                except Exception:
+                    pass
                 self._serial.close()
                 logger.info("Disconnected from Arduino")
-            
             self._is_connected = False
 
     def is_connected(self) -> bool:
         """Check if currently connected to Arduino."""
         return self._is_connected
+
+    def _write_message(self, message: str) -> None:
+        if not self._serial or not self._serial.is_open:
+            raise ArduinoCommunicationError("Serial port is not open")
+
+        try:
+            self._serial.write(message.encode())
+            self._serial.flush()
+        except serial.SerialException as e:
+            logger.error(f"Serial write failed: {e}")
+            self._is_connected = False
+            raise ArduinoCommunicationError(f"Serial communication failed: {e}")
+
+    def _wait_for_response(
+        self,
+        expected_responses: Sequence[str],
+        timeout: float,
+    ) -> Optional[str]:
+        saved_responses = []
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                response = self._response_queue.get(timeout=0.1)
+                logger.debug(f"← Received: {response}")
+
+                if response.startswith(ArduinoResponse.ERROR.value) or response.startswith(ArduinoResponse.MOTORS_ERROR.value):
+                    for saved in saved_responses:
+                        self._response_queue.put(saved)
+                    return response
+
+                if any(response.startswith(prefix) for prefix in expected_responses):
+                    for saved in saved_responses:
+                        self._response_queue.put(saved)
+                    return response
+
+                saved_responses.append(response)
+            except Empty:
+                continue
+
+        logger.warning("Timeout waiting for Arduino response")
+        for saved in saved_responses:
+            self._response_queue.put(saved)
+        return None
 
     def send_command(
         self,
@@ -223,35 +281,21 @@ class ArduinoConnection:
         timeout = timeout or self.timeout
         expected_responses = list(expected_responses or self._expected_responses_for(command))
 
-        try:
-            with self._connection_lock:
-                message = f"{command.value}\n"
-                self._serial.write(message.encode())
-                logger.debug(f"→ Sent: {command.value}")
+        with self._connection_lock:
+            message = f"{command.value}\n"
+            self._write_message(message)
+            logger.debug(f"→ Sent: {command.value}")
 
-            saved_responses = []
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                try:
-                    response = self._response_queue.get(timeout=0.1)
-                    logger.debug(f"← Received: {response}")
-                    if any(response.startswith(prefix) for prefix in expected_responses):
-                        for saved in saved_responses:
-                            self._response_queue.put(saved)
-                        return True
-                    saved_responses.append(response)
-                except Empty:
-                    continue
-
+        response = self._wait_for_response(expected_responses, timeout)
+        if response is None:
             logger.warning(f"Timeout waiting for Arduino response to {command.value}")
-            for saved in saved_responses:
-                self._response_queue.put(saved)
             return False
 
-        except serial.SerialException as e:
-            logger.error(f"Serial write failed: {e}")
-            self._is_connected = False
-            raise ArduinoCommunicationError(f"Serial communication failed: {e}")
+        if response.startswith(ArduinoResponse.ERROR.value) or response.startswith(ArduinoResponse.MOTORS_ERROR.value):
+            logger.warning(f"Arduino returned error response for {command.value}: {response}")
+            return False
+
+        return True
 
     def ping(self) -> bool:
         """
@@ -282,47 +326,52 @@ class ArduinoConnection:
         """
         Request full hardware status from Arduino.
         
-        Parses CSV response: "motor_ok,left_speed,right_speed,voltage,temp"
+        Parses CSV response: "M0_speed,M0_dir,M1_speed,M1_dir,M2_speed,M2_dir,M3_speed,M3_dir,P_speed,P_dir"
         
         Returns:
             HardwareStatus if successful, None if failed
         """
-        try:
-            with self._connection_lock:
-                self._serial.write(b"GET_STATUS\n")
-                logger.debug("→ Sent: GET_STATUS")
-
-            # Read status line
-            start_time = time.time()
-            timeout = self.timeout
-            
-            while time.time() - start_time < timeout:
-                try:
-                    response = self._response_queue.get(timeout=0.1)
-                    
-                    # Parse CSV status
-                    if response.startswith("STATUS:"):
-                        parts = response[7:].split(",")
-                        if len(parts) >= 5:
-                            return HardwareStatus(
-                                motors_ok=parts[0] == "1",
-                                motor_left_speed=int(parts[1]),
-                                motor_right_speed=int(parts[2]),
-                                battery_voltage=float(parts[3]),
-                                temperature=float(parts[4]),
-                                timestamp=time.time(),
-                            )
-
-                except (Empty, ValueError, IndexError) as e:
-                    logger.debug(f"Status parse error: {e}")
-                    continue
-
-            logger.warning("Timeout getting hardware status")
+        if not self._is_connected:
+            logger.error("Cannot get hardware status: Arduino not connected")
             return None
 
-        except serial.SerialException as e:
+        try:
+            with self._connection_lock:
+                self._write_message("GET_STATUS\n")
+                logger.debug("→ Sent: GET_STATUS")
+
+            response = self._wait_for_response([f"{ArduinoResponse.STATUS.value}:"], self.timeout)
+            if response is None:
+                logger.warning("Timeout getting hardware status")
+                return None
+
+            if response.startswith(f"{ArduinoResponse.STATUS.value}:"):
+                parts = response[len(f"{ArduinoResponse.STATUS.value}:"):].split(",")
+                if len(parts) >= 10:
+                    try:
+                        return HardwareStatus(
+                            motors_ok=True,
+                            motor_0_speed=int(parts[0]),
+                            motor_0_direction=int(parts[1]),
+                            motor_1_speed=int(parts[2]),
+                            motor_1_direction=int(parts[3]),
+                            motor_2_speed=int(parts[4]),
+                            motor_2_direction=int(parts[5]),
+                            motor_3_speed=int(parts[6]),
+                            motor_3_direction=int(parts[7]),
+                            pump_speed=int(parts[8]),
+                            pump_direction=int(parts[9]),
+                            timestamp=time.time(),
+                        )
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Failed to parse STATUS response: {response} ({e})")
+                        return None
+
+            logger.warning(f"Unexpected hardware status response: {response}")
+            return None
+
+        except ArduinoCommunicationError as e:
             logger.error(f"Failed to get status: {e}")
-            self._is_connected = False
             return None
 
     def move(self, direction: str) -> bool:
@@ -336,11 +385,11 @@ class ArduinoConnection:
             True if command sent successfully
         """
         direction_map = {
-            "forward": ArduinoCommand.MOVE_FORWARD,
-            "backward": ArduinoCommand.MOVE_BACKWARD,
-            "left": ArduinoCommand.MOVE_LEFT,
-            "right": ArduinoCommand.MOVE_RIGHT,
-            "stop": ArduinoCommand.STOP,
+            "forward": (0, 200, 1, 1, 200, 1),    # (M0_spd, M0_dir, M1_spd, M1_dir, ...)
+            "backward": (0, 200, 0, 1, 200, 0),
+            "left": (0, 175, 0, 1, 175, 1),
+            "right": (0, 175, 1, 1, 175, 0),
+            "stop": (0, 0, 0, 1, 0, 0),
         }
 
         if direction not in direction_map:
@@ -348,10 +397,122 @@ class ArduinoConnection:
             return False
 
         try:
-            cmd = direction_map[direction]
-            return self.send_command(cmd)
-        except ArduinoCommunicationError as e:
+            motor_0_spd, motor_0_dir, motor_1_spd, motor_1_dir, motor_2_spd, motor_2_dir = direction_map[direction]
+            
+            # Set motor 0
+            if not self.set_motor(0, motor_0_spd, motor_0_dir):
+                return False
+            
+            # Set motor 1
+            if not self.set_motor(1, motor_1_spd, motor_1_dir):
+                return False
+            
+            # Set motors 2 and 3 (usually same as 0 and 1)
+            if not self.set_motor(2, motor_0_spd, motor_0_dir):
+                return False
+            
+            if not self.set_motor(3, motor_1_spd, motor_1_dir):
+                return False
+            
+            return True
+        except Exception as e:
             logger.error(f"Move command failed: {e}")
+            return False
+
+    def set_motor(self, motor_id: int, speed: int, direction: int) -> bool:
+        """
+        Set speed and direction for a specific motor.
+        
+        Args:
+            motor_id: 0-3 (motor identifier)
+            speed: 0-255 (PWM speed)
+            direction: 0 (backward) or 1 (forward)
+            
+        Returns:
+            True if command sent successfully
+        """
+        if motor_id < 0 or motor_id > 3:
+            logger.error(f"Invalid motor ID: {motor_id}")
+            return False
+
+        speed = max(0, min(255, speed))
+        direction = 1 if direction != 0 else 0
+
+        try:
+            with self._connection_lock:
+                message = f"SET_MOTOR {motor_id} {speed} {direction}\n"
+                self._write_message(message)
+                logger.debug(f"→ Sent: SET_MOTOR {motor_id} {speed} {direction}")
+
+            response = self._wait_for_response([ArduinoResponse.OK.value], self.timeout)
+            if response is None:
+                logger.warning(f"Timeout setting motor {motor_id}")
+                return False
+
+            if response.startswith(ArduinoResponse.ERROR.value):
+                logger.warning(f"Arduino returned error for motor {motor_id}: {response}")
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Set motor {motor_id} failed: {e}")
+            return False
+
+    def set_pump(self, speed: int, direction: int) -> bool:
+        """
+        Set speed and direction for the pump motor.
+        
+        Args:
+            speed: 0-255 (PWM speed)
+            direction: 0 (backward) or 1 (forward)
+            
+        Returns:
+            True if command sent successfully
+        """
+        speed = max(0, min(255, speed))
+        direction = 1 if direction != 0 else 0
+
+        try:
+            with self._connection_lock:
+                message = f"SET_PUMP {speed} {direction}\n"
+                self._write_message(message)
+                logger.debug(f"→ Sent: SET_PUMP {speed} {direction}")
+
+            response = self._wait_for_response([ArduinoResponse.OK.value], self.timeout)
+            if response is None:
+                logger.warning("Timeout setting pump")
+                return False
+
+            if response.startswith(ArduinoResponse.ERROR.value):
+                logger.warning(f"Arduino returned error for pump: {response}")
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Set pump failed: {e}")
+            return False
+
+    def stop_all(self) -> bool:
+        """
+        Stop all motors and pump.
+        
+        Returns:
+            True if command sent successfully
+        """
+        try:
+            with self._connection_lock:
+                message = "STOP_ALL\n"
+                self._write_message(message)
+                logger.debug("→ Sent: STOP_ALL")
+
+            response = self._wait_for_response([ArduinoResponse.OK.value], self.timeout)
+            if response is None:
+                logger.warning("Timeout stopping all motors")
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"Stop all failed: {e}")
             return False
 
     def _start_reader_thread(self) -> None:
@@ -390,10 +551,15 @@ class ArduinoConnection:
                 if char == "\n":
                     line = buffer.strip()
                     if line:
-                        self._response_queue.put(line)
-                        logger.debug(f"Response queued: {line}")
-                    buffer = ""
-
+                            try:
+                                self._response_queue.put_nowait(line)
+                            except Full:
+                                logger.warning("Arduino response queue full, dropping oldest response")
+                                try:
+                                    self._response_queue.get_nowait()
+                                except Empty:
+                                    pass
+                                self._response_queue.put_nowait(line)
             except (serial.SerialException, UnicodeDecodeError) as e:
                 logger.warning(f"Reader thread error: {e}")
                 self._is_connected = False
