@@ -35,6 +35,8 @@ class HealthCheckStatus(Enum):
     """Result of a health check."""
     OK = "OK"
     WARNING = "WARNING"
+    DEGRADED = "DEGRADED"
+    RECOVERING = "RECOVERING"
     ERROR = "ERROR"
     SKIPPED = "SKIPPED"
 
@@ -192,7 +194,11 @@ class HealthCheckService:
                 result = HealthCheckResult(
                     name=check_name,
                     status=HealthCheckStatus.ERROR,
-                    message=f"Motors unhealthy - L:{status.left_speed} R:{status.right_speed}",
+                    message=(
+                        f"Motors unhealthy - speeds: "
+                        f"[{status.motor_0_speed},{status.motor_1_speed},"
+                        f"{status.motor_2_speed},{status.motor_3_speed}]"
+                    ),
                     duration_ms=duration,
                     timestamp=time.time(),
                 )
@@ -205,8 +211,9 @@ class HealthCheckService:
                 name=check_name,
                 status=HealthCheckStatus.OK,
                 message=(
-                    f"Motors OK - L:{status.left_speed} R:{status.right_speed} "
-                    f"V:{status.battery_voltage:.1f}V T:{status.temperature:.1f}°C"
+                    f"Motors OK - speeds: "
+                    f"[{status.motor_0_speed},{status.motor_1_speed},"
+                    f"{status.motor_2_speed},{status.motor_3_speed}]"
                 ),
                 duration_ms=duration,
                 timestamp=time.time(),
@@ -317,12 +324,12 @@ class HealthCheckService:
 
         try:
             if model_load_fn is None:
-                logger.warning(f"⚠ {check_name}: No load function provided")
+                logger.error(f"✗ {check_name}: No load function provided")
                 duration = (time.time() - start_time) * 1000
                 result = HealthCheckResult(
                     name=check_name,
-                    status=HealthCheckStatus.SKIPPED,
-                    message="Model check not implemented",
+                    status=HealthCheckStatus.ERROR,
+                    message="Model load function missing",
                     duration_ms=duration,
                     timestamp=time.time(),
                 )
@@ -386,6 +393,15 @@ class HealthCheckService:
             if result.status == HealthCheckStatus.ERROR:
                 return False
         return True
+
+    def get_overall_status(self) -> HealthCheckStatus:
+        if any(result.status == HealthCheckStatus.ERROR for result in self._results.values()):
+            return HealthCheckStatus.ERROR
+        if any(result.status == HealthCheckStatus.DEGRADED for result in self._results.values()):
+            return HealthCheckStatus.DEGRADED
+        if any(result.status == HealthCheckStatus.WARNING for result in self._results.values()):
+            return HealthCheckStatus.WARNING
+        return HealthCheckStatus.OK
 
     def get_error_summary(self) -> str:
         """Get summary of all failures for error reporting."""

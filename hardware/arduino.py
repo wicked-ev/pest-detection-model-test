@@ -22,7 +22,7 @@ import logging
 from typing import Optional, Sequence
 from enum import Enum
 from dataclasses import dataclass
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from queue import Queue, Empty, Full
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,12 @@ class ArduinoConnection:
         self._is_connected = False
         self._response_queue: Queue[str] = Queue(maxsize=100)
         self._reader_thread: Optional[Thread] = None
-        self._stop_reader = False
+        self._stop_reader = Event()
+        self._reconnect_thread: Optional[Thread] = None
+        self._reconnect_requested = Event()
+        self._auto_reconnect = True
+        self._last_response_time = time.time()
+        self._last_command_time = time.time()
 
     def _expected_responses_for(self, command: ArduinoCommand) -> Sequence[str]:
         """Return acceptable response strings for a given command."""
@@ -143,6 +148,9 @@ class ArduinoConnection:
         Returns:
             True if connected, False if all attempts failed
         """
+        if self._is_connected and self._serial and self._serial.is_open:
+            return True
+
         for attempt in range(self.max_reconnect_attempts):
             try:
                 with self._connection_lock:
@@ -165,6 +173,8 @@ class ArduinoConnection:
                     self._serial.reset_output_buffer()
 
                     self._is_connected = True
+                    self._last_response_time = time.time()
+                    self._last_command_time = time.time()
                     logger.info(f"✓ Connected to Arduino on {self.port}")
 
                     # Start background reader thread
@@ -190,11 +200,14 @@ class ArduinoConnection:
 
     def disconnect(self) -> None:
         """Safely disconnect from Arduino."""
-        with self._connection_lock:
-            self._stop_reader = True
+        self._stop_reader.set()
+        self._reconnect_requested.clear()
 
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=2.0)
+
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            self._reconnect_thread.join(timeout=2.0)
 
         with self._connection_lock:
             if self._serial and self._serial.is_open:
@@ -218,6 +231,7 @@ class ArduinoConnection:
         try:
             self._serial.write(message.encode())
             self._serial.flush()
+            self._last_command_time = time.time()
         except serial.SerialException as e:
             logger.error(f"Serial write failed: {e}")
             self._is_connected = False
@@ -235,6 +249,7 @@ class ArduinoConnection:
             try:
                 response = self._response_queue.get(timeout=0.1)
                 logger.debug(f"← Received: {response}")
+                self._last_response_time = time.time()
 
                 if response.startswith(ArduinoResponse.ERROR.value) or response.startswith(ArduinoResponse.MOTORS_ERROR.value):
                     for saved in saved_responses:
@@ -254,6 +269,39 @@ class ArduinoConnection:
         for saved in saved_responses:
             self._response_queue.put(saved)
         return None
+
+    def _clear_response_queue(self) -> None:
+        while not self._response_queue.empty():
+            try:
+                self._response_queue.get_nowait()
+            except Empty:
+                break
+
+    def last_response_age(self) -> float:
+        return time.time() - self._last_response_time
+
+    def is_reader_alive(self) -> bool:
+        return self._reader_thread is not None and self._reader_thread.is_alive()
+
+    def reconnect_if_needed(self) -> bool:
+        if self._is_connected:
+            return True
+        return self.connect()
+
+    def request_reconnect(self) -> None:
+        if not self._is_connected and self._auto_reconnect:
+            self._reconnect_requested.set()
+
+    def send_emergency_stop(self, timeout: Optional[float] = None) -> bool:
+        try:
+            with self._connection_lock:
+                self._write_message("STOP_ALL\n")
+                logger.warning("→ Sent emergency STOP_ALL")
+            response = self._wait_for_response([ArduinoResponse.OK.value], timeout or self.timeout)
+            return response is not None
+        except Exception as e:
+            logger.error(f"Emergency stop failed: {e}")
+            return False
 
     def send_command(
         self,
@@ -282,6 +330,7 @@ class ArduinoConnection:
         expected_responses = list(expected_responses or self._expected_responses_for(command))
 
         with self._connection_lock:
+            self._clear_response_queue()
             message = f"{command.value}\n"
             self._write_message(message)
             logger.debug(f"→ Sent: {command.value}")
@@ -517,13 +566,39 @@ class ArduinoConnection:
 
     def _start_reader_thread(self) -> None:
         """Start background thread to read serial responses."""
-        self._stop_reader = False
+        self._stop_reader.clear()
         self._reader_thread = Thread(
             target=self._reader_loop,
             daemon=True,
             name="ArduinoReader",
         )
         self._reader_thread.start()
+        self._ensure_reconnect_thread()
+
+    def _ensure_reconnect_thread(self) -> None:
+        if self._reconnect_thread and self._reconnect_thread.is_alive():
+            return
+        self._reconnect_thread = Thread(
+            target=self._reconnect_loop,
+            daemon=True,
+            name="ArduinoReconnect",
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        while not self._stop_reader.is_set():
+            self._reconnect_requested.wait(timeout=1.0)
+            if self._stop_reader.is_set():
+                break
+            if not self._reconnect_requested.is_set():
+                continue
+            logger.info("Arduino connection lost, attempting reconnect")
+            if self.connect():
+                logger.info("Arduino reconnect succeeded")
+                self._reconnect_requested.clear()
+            else:
+                logger.warning("Arduino reconnect attempt failed")
+                time.sleep(self.reconnect_delay)
 
     def _reader_loop(self) -> None:
         """
@@ -533,7 +608,7 @@ class ArduinoConnection:
         """
         buffer = ""
         
-        while not self._stop_reader:
+        while not self._stop_reader.is_set():
             try:
                 if not self._serial or not self._serial.is_open:
                     break
@@ -546,25 +621,37 @@ class ArduinoConnection:
                 
                 char = byte.decode("utf-8", errors="ignore")
                 buffer += char
-                
+
+                if len(buffer) > 256:
+                    logger.warning("Discarding oversized serial buffer to recover from corruption")
+                    buffer = ""
+                    continue
+
                 # Process complete lines (end with newline)
                 if char == "\n":
                     line = buffer.strip()
+                    buffer = ""
                     if line:
+                        self._last_response_time = time.time()
+                        try:
+                            self._response_queue.put_nowait(line)
+                        except Full:
+                            logger.warning("Arduino response queue full, dropping oldest response")
                             try:
-                                self._response_queue.put_nowait(line)
-                            except Full:
-                                logger.warning("Arduino response queue full, dropping oldest response")
-                                try:
-                                    self._response_queue.get_nowait()
-                                except Empty:
-                                    pass
-                                self._response_queue.put_nowait(line)
+                                self._response_queue.get_nowait()
+                            except Empty:
+                                pass
+                            self._response_queue.put_nowait(line)
             except (serial.SerialException, UnicodeDecodeError) as e:
                 logger.warning(f"Reader thread error: {e}")
                 self._is_connected = False
+                if self._auto_reconnect:
+                    self._reconnect_requested.set()
                 break
 
             except Exception as e:
                 logger.error(f"Unexpected reader thread error: {e}")
+                self._is_connected = False
+                if self._auto_reconnect:
+                    self._reconnect_requested.set()
                 break

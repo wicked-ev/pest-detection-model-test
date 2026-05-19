@@ -20,11 +20,15 @@ This is the only module that directly orchestrates all subsystems.
 All other modules should be independent and testable.
 """
 
-import sys, os
+import os
+import sys
 import logging
-from pathlib import Path
 import signal
 import time
+import threading
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Optional, Tuple
 
 # Add project root to path for imports
 project_root = Path(__file__).parent
@@ -49,6 +53,9 @@ from hardware.arduino import ArduinoConnection, ArduinoCommunicationError
 from hardware.motors import MotorController, MovementDirection
 from states.state_machine import StateMachine, RobotState
 from services.health_service import HealthCheckService, HealthCheckStatus
+from services.emergency_service import EmergencyStopService
+from services.lifecycle_manager import LifecycleManager
+from services.watchdog_service import WatchdogService
 from services.wifi_service import WiFiManager, HotspotProvisioningService
 from services.network_service import NetworkService
 from services.camera_service import CameraService
@@ -78,10 +85,11 @@ class RobotApplication:
         
         # State machine
         self.state_machine = StateMachine()
+        self.lifecycle_manager = LifecycleManager()
         
         # Hardware components
-        self.arduino: ArduinoConnection | None = None
-        self.motors: MotorController | None = None
+        self.arduino: Optional[ArduinoConnection] = None
+        self.motors: Optional[MotorController] = None
         
         # Services
         self.health_service = HealthCheckService()
@@ -90,10 +98,19 @@ class RobotApplication:
         self.network_service = NetworkService()
         self.camera_service = CameraService()
         self.model_service = ModelService()
+        self.emergency_service = EmergencyStopService()
+        self.watchdog_service = WatchdogService()
+
+        self.emergency_service.register_callback(self._stop_all_movement)
+        self.emergency_service.register_callback(self._on_emergency_requested)
+        self.watchdog_service.register_failure_callback(self._on_watchdog_failure)
         
         # Lifecycle
+        self._event_queue: Queue[Tuple[str, Optional[object]]] = Queue()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_started = False
+        self._provisioning_active = False
         self._is_running = False
-        self._shutdown_requested = False
         
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
@@ -101,221 +118,75 @@ class RobotApplication:
         
         logger.info("✓ Application initialized")
 
-        
     def startup(self) -> bool:
-        """
-        Execute startup sequence.
-        
-        Flow:
-        1. BOOTING → Initialize runtime environment
-        2. WIFI_CONNECTING → Connect to WiFi or provision hotspot
-        3. SERVER_CONNECTING → Establish remote server link
-        4. CONNECTING → Establish Arduino connection
-        5. CHECKING_SYSTEMS → Run diagnostics
-        6. READY → All systems operational
-        
-        Returns:
-            True if startup successful, False if failed
-        """
+        """Execute a safe startup sequence with rollback support."""
         logger.info(f"\n{configs.get_config_summary()}\n")
         logger.info("=" * 70)
         logger.info("STARTING ROBOT STARTUP SEQUENCE")
         logger.info("=" * 70)
-        
+
+        self._shutdown_requested.clear()
+        self._shutdown_started = False
+        self._provisioning_active = False
+        self._is_running = False
+        self.lifecycle_manager = LifecycleManager()
+
         try:
-            # --- Phase 1: BOOTING ---
             if not self.state_machine.transition_to(
                 RobotState.BOOTING,
-                reason="Startup initiated"
+                reason="Startup initiated",
             ):
                 logger.error("Failed to enter BOOTING state")
                 return False
-            
+
             logger.info("\n[1/4] PHASE: BOOTING")
             logger.info("-" * 70)
             time.sleep(0.5)
-            
-            # --- Phase 2: WIFI CONNECTION ---
-            logger.info("\n[2/5] PHASE: WIFI CONNECTION")
-            logger.info("-" * 70)
-            
-            if not self.state_machine.transition_to(
-                RobotState.WIFI_CONNECTING,
-                reason="Attempting saved WiFi networks"
-            ):
-                logger.error("Failed to enter WIFI_CONNECTING state")
-                return False
-            
-            wifi_connected = self.wifi_manager.connect_saved_networks()
-            if not wifi_connected:
-                logger.warning("Saved WiFi credentials unavailable or failed")
-                if not self.hotspot_service.enter_provisioning_mode():
-                    error_msg = "Unable to start hotspot provisioning"
-                    self.state_machine.transition_to(
-                        RobotState.ERROR,
-                        reason="Hotspot provisioning failed",
-                        error_message=error_msg,
-                    )
-                    return False
-                
-                self.state_machine.transition_to(
-                    RobotState.HOTSPOT_MODE,
-                    reason="Hotspot mode active for WiFi provisioning"
-                )
-                self._is_running = True
-                logger.info("Hotspot mode enabled; waiting for WiFi credentials")
-                
-            
-            logger.info("✓ WiFi connection established")
-            
-            # --- Phase 3: SERVER CONNECTION ---
-            logger.info("\n[3/5] PHASE: SERVER CONNECTION")
-            logger.info("-" * 70)
-            
 
-            if not self.state_machine.transition_to(
-                RobotState.SERVER_CONNECTING,
-                reason="Connecting to remote control server"
-            ):
-                logger.error("Failed to enter SERVER_CONNECTING state")
+            if not self._startup_network():
+                self._rollback_startup()
                 return False
-            
-            if not self.network_service.connect_to_server():
-                error_msg = f"Failed to connect to server at {configs.SERVER_URL}"
-                logger.error(f"✗ {error_msg}")
-                self.state_machine.transition_to(
-                    RobotState.ERROR,
-                    reason="Server connection failed",
-                    error_message=error_msg,
-                )
+
+            if self._provisioning_active:
+                logger.info("Provisioning mode is active; normal runtime startup is suspended")
+                return True
+
+            if not self._startup_server():
+                self._rollback_startup()
                 return False
-            
-            logger.info("✓ Connected to remote control server")
-            
-            # --- Phase 4: Initialize Hardware Connection ---
-            logger.info("\n[4/5] PHASE: CONNECTING HARDWARE")
+
+            if not self._startup_hardware():
+                self._rollback_startup()
+                return False
+
+            if not self._startup_services():
+                self._rollback_startup()
+                return False
+
+            logger.info("\n[5/5] PHASE: ENTERING READY STATE")
             logger.info("-" * 70)
-            
-            # Connect to Arduino
-            logger.info("Connecting to Arduino...")
-            self.arduino = ArduinoConnection(
-                port=configs.ARDUINO_PORT,
-                baudrate=configs.ARDUINO_BAUDRATE,
-                timeout=configs.ARDUINO_TIMEOUT,
-                write_timeout=configs.ARDUINO_WRITE_TIMEOUT,
-                max_reconnect_attempts=configs.ARDUINO_MAX_RECONNECT_ATTEMPTS,
-                reconnect_delay=configs.ARDUINO_RECONNECT_DELAY,
-            )
-            
-            if not self.arduino.connect():
-                error_msg = (
-                    f"Failed to connect to Arduino on {configs.ARDUINO_PORT}"
-                )
-                logger.error(f"✗ {error_msg}")
-                self.state_machine.transition_to(
-                    RobotState.ERROR,
-                    reason="Arduino connection failed",
-                    error_message=error_msg,
-                )
-                return False
-            
-            logger.info("✓ Arduino connected")
-            
-            # Initialize motors
-            logger.info("Initializing motor controller...")
-            self.motors = MotorController(self.arduino)
-            
-            # --- Phase 5: CHECKING_SYSTEMS ---
-            logger.info("\n[5/5] PHASE: CHECKING SYSTEMS")
-            logger.info("-" * 70)
-            
-            if not self.state_machine.transition_to(
-                RobotState.CHECKING_SYSTEMS,
-                reason="Starting system diagnostics"
-            ):
-                logger.error("Failed to enter CHECKING_SYSTEMS state")
-                return False
-            
-            # Run health checks
-            self.health_service.clear_results()
-            
-            # Check 1: Arduino Connection
-            logger.info("\nCheck 1: Arduino Connection")
-            result = self.health_service.check_arduino_connection(self.arduino)
-            if result.status == HealthCheckStatus.ERROR:
-                self._handle_check_failure(result)
-                return False
-            
-            # Check 2: Motors
-            logger.info("\nCheck 2: Motor System")
-            result = self.health_service.check_motors(self.motors)
-            if result.status == HealthCheckStatus.ERROR:
-                self._handle_check_failure(result)
-                return False
-            
-            # Check 3: Camera 
-            logger.info("\nCheck 3: Camera System")
-            result = self.health_service.check_camera(
-                camera_available_fn=self.camera_service.is_available
-            )
-            if result.status == HealthCheckStatus.ERROR:
-                logger.warning(f"⚠ Camera check failed: {result.message}")
-                # Camera failure is not critical, continue
-            
-            
-            # Model RFDTRNano -> ARM CPU PI -> Export ONNX  
-            # test desktop
-            # test PI?
-            
-            # Check 4: AI Model
-            logger.info("\nCheck 4: AI Detection Model")
-            result = self.health_service.check_ai_model(
-                model_path=str(configs.MODEL_PATH),
-                model_load_fn=self.model_service.verify_load
-            )
-            if result.status == HealthCheckStatus.ERROR:
-                logger.warning(f"⚠ Model check failed: {result.message}")
-                # Model failure is not critical, continue
-            
-            
-            # Verify all critical checks passed
-            if not self.health_service.is_all_healthy():
-                error_summary = self.health_service.get_error_summary()
-                logger.error(f"✗ Critical health checks failed: {error_summary}")
-                self.state_machine.transition_to(
-                    RobotState.ERROR,
-                    reason="Health checks failed",
-                    error_message=error_summary,
-                )
-                return False
-            
-            logger.info("\n✓ All health checks passed!")
-            
-            # --- Phase 4: READY ---
-            logger.info("\n[4/4] PHASE: ENTERING READY STATE")
-            logger.info("-" * 70)
-            
             if not self.state_machine.transition_to(
                 RobotState.READY,
-                reason="All systems operational"
+                reason="All systems operational",
             ):
                 logger.error("Failed to enter READY state")
+                self._rollback_startup()
                 return False
-            
+
             logger.info("\n" + "=" * 70)
             logger.info("✓ STARTUP COMPLETE - ROBOT READY")
             logger.info("=" * 70)
-            
             self._is_running = True
             return True
 
-        except Exception as e:
-            logger.error(f"Startup failed with exception: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Startup failed with exception", exc_info=True)
             self.state_machine.transition_to(
                 RobotState.ERROR,
                 reason="Startup exception",
-                error_message=str(e),
+                error_message=str(exc),
             )
+            self._rollback_startup()
             return False
 
     def run(self) -> None:
@@ -331,65 +202,30 @@ class RobotApplication:
         if not self._is_running:
             logger.warning("Cannot run: startup was not successful")
             return
-        
+
         logger.info("\nEntering main operating loop...")
         logger.info("Robot ready for commands")
         logger.info("(Press Ctrl+C to shutdown)\n")
-        
+
         try:
-            # In a real application, this would:
-            # - Listen to WebSocket for commands
-            # - Run detection service in background
-            # - Process autonomous mode
-            # - Handle state transitions
-            
-            while not self._shutdown_requested and self._is_running:
-                current_state = self.state_machine.get_current_state()
-                
-                # Handle state-specific operations
-                if current_state == RobotState.READY:
-                    time.sleep(0.5)
-                
-                elif current_state == RobotState.WIFI_CONNECTING:
-                    logger.debug("Waiting for WiFi connection")
-                    time.sleep(0.5)
-                
-                elif current_state == RobotState.SERVER_CONNECTING:
-                    logger.debug("Waiting for server connection")
-                    time.sleep(0.5)
-                
-                elif current_state == RobotState.HOTSPOT_MODE:
-                    logger.info("Hotspot mode is active for provisioning")
-                    time.sleep(2.0)
-                
-                elif current_state == RobotState.PROVISIONING:
-                    logger.info("Awaiting WiFi credentials from provisioning client")
-                    time.sleep(2.0)
-                
-                elif current_state == RobotState.REMOTE_CONTROL:
-                    logger.debug("Remote control operational")
-                    time.sleep(0.5)
-                
-                elif current_state == RobotState.AUTONOMOUS:
-                    logger.debug("Autonomous mode active")
-                    time.sleep(0.5)
-                
-                elif current_state == RobotState.ERROR:
-                    logger.warning("Robot in ERROR state, awaiting recovery...")
-                    time.sleep(1.0)
-                
-                elif current_state == RobotState.SHUTDOWN:
-                    logger.info("Shutdown state reached")
+            while not self._shutdown_requested.is_set():
+                if self.emergency_service.is_engaged():
+                    self._enqueue_event("emergency", self.emergency_service.reason())
+
+                try:
+                    event_type, payload = self._event_queue.get(timeout=0.5)
+                    self._handle_event(event_type, payload)
+                except Empty:
+                    self._perform_periodic_housekeeping()
+                    continue
+
+                if self._shutdown_requested.is_set():
                     break
-                
-                else:
-                    logger.debug(f"Current state: {current_state.value}")
-                    time.sleep(0.5)
 
         except KeyboardInterrupt:
             logger.info("Keyboard interrupt received")
-        except Exception as e:
-            logger.error(f"Error in main loop: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("Error in main loop", exc_info=True)
         finally:
             self.shutdown()
 
@@ -403,52 +239,205 @@ class RobotApplication:
         3. Disconnect hardware
         4. Close resources
         """
-        if not self._is_running:
+        if self._shutdown_started:
+            logger.debug("Shutdown already in progress")
             return
-        
+
+        self._shutdown_started = True
+        self._shutdown_requested.set()
+        self._is_running = False
+
         logger.info("\n" + "=" * 70)
         logger.info("INITIATING SHUTDOWN SEQUENCE")
         logger.info("=" * 70)
-        
-        self._is_running = False
-        
+
         try:
-            # Transition to shutdown state
             self.state_machine.transition_to(
                 RobotState.SHUTDOWN,
-                reason="Graceful shutdown"
+                reason="Graceful shutdown",
             )
-            
-            # Stop motors immediately
-            if self.motors:
-                logger.info("Stopping motors...")
-                self.motors.stop()
-                time.sleep(0.5)
-            
-            # Disconnect network
-            if self.network_service:
-                logger.info("Disconnecting network services...")
-                self.network_service.disconnect()
 
-            # Disconnect Arduino
-            if self.arduino:
-                logger.info("Disconnecting Arduino...")
-                self.arduino.disconnect()
-            
+            if self.emergency_service.is_engaged():
+                logger.warning("Emergency engagement detected during shutdown")
+                self._stop_all_movement()
+
+            self.lifecycle_manager.cleanup_all()
+
             logger.info("✓ Shutdown complete")
             logger.info("=" * 70)
 
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Error during shutdown")
 
     def _handle_shutdown_signal(self, signum, frame):
         """Handle OS shutdown signals (SIGINT, SIGTERM)."""
         logger.info(f"Received signal {signum}, initiating shutdown...")
-        self._shutdown_requested = True
+        self._shutdown_requested.set()
 
     def _handle_check_failure(self, result) -> None:
         """Log and record health check failures."""
         logger.error(f"✗ {result.name}: {result.message}")
+
+    def _register_watchdog_targets(self) -> None:
+        self.watchdog_service.register_target(
+            name="Camera Capture",
+            check_fn=self._check_camera_watchdog,
+            recovery_fn=self._restart_camera_service,
+            critical=True,
+        )
+        self.watchdog_service.register_target(
+            name="Model Inference",
+            check_fn=self._check_model_watchdog,
+            recovery_fn=self._restart_model_service,
+            critical=True,
+        )
+        self.watchdog_service.register_target(
+            name="Arduino Connection",
+            check_fn=self._check_arduino_watchdog,
+            recovery_fn=self._restart_arduino_connection,
+            critical=True,
+        )
+        self.watchdog_service.start()
+
+    def _check_camera_watchdog(self):
+        if not self.camera_service.is_running():
+            return False, "Camera capture thread inactive"
+        age = self.camera_service.get_last_frame_age()
+        if age is None:
+            return False, "No frame received from camera"
+        if age > 2.0:
+            return False, f"Camera frame age stale ({age:.1f}s)"
+        return True, "Camera healthy"
+
+    def _restart_camera_service(self) -> bool:
+        logger.warning("Watchdog attempting camera recovery")
+        self.camera_service.stop()
+        self.camera_service.start()
+        return self.camera_service.wait_for_first_frame(timeout=5.0)
+
+    def _check_model_watchdog(self):
+        if not self.model_service.is_streaming():
+            return False, "Model inference not running"
+        age = self.model_service.get_last_inference_age()
+        if age is None:
+            return False, "No inference output yet"
+        if age > 5.0:
+            return False, f"Inference output stale ({age:.1f}s)"
+        return True, "Model inference healthy"
+
+    def _restart_model_service(self) -> bool:
+        logger.warning("Watchdog attempting model recovery")
+        self.model_service.restart_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
+        return self.model_service.is_streaming()
+
+    def _check_arduino_watchdog(self):
+        if self.arduino is None or not self.arduino.is_connected():
+            return False, "Arduino disconnected"
+        if self.arduino.last_response_age() > max(3.0, configs.ARDUINO_TIMEOUT * 2):
+            if self.arduino.ping():
+                return True, "Arduino responding"
+            return False, "Arduino not responding"
+        return True, "Arduino healthy"
+
+    def _restart_arduino_connection(self) -> bool:
+        logger.warning("Watchdog attempting Arduino recovery")
+        if self.arduino is None:
+            return False
+        return self.arduino.reconnect_if_needed()
+
+    def _on_emergency_stop(self, reason: str) -> None:
+        logger.critical(f"Emergency stop callback invoked: {reason}")
+        self._stop_all_movement()
+        self.shutdown()
+
+    def _on_watchdog_failure(self, target_name: str, message: str) -> None:
+        logger.critical(f"Watchdog failure for {target_name}: {message}")
+        self.emergency_service.engage(
+            f"Watchdog failure ({target_name}): {message}"
+        )
+
+    def _stop_all_movement(self) -> None:
+        if self.motors:
+            try:
+                logger.warning("Stopping motors due to emergency")
+                self.motors.stop()
+            except Exception as exc:
+                logger.error(f"Failed to stop motors: {exc}")
+        if self.arduino:
+            try:
+                logger.warning("Sending emergency stop to Arduino")
+                self.arduino.send_emergency_stop()
+            except Exception as exc:
+                logger.error(f"Emergency Arduino stop failed: {exc}")
+
+    # --- Helper methods (minimal, typed stubs to satisfy callers) ---
+    def _enqueue_event(self, event_type: str, payload: Optional[object] = None) -> None:
+        """Place an event onto the internal event queue."""
+        try:
+            self._event_queue.put((event_type, payload))
+        except Exception:
+            logger.exception("Failed to enqueue event")
+
+    def _handle_event(self, event_type: str, payload: Optional[object]) -> None:
+        """Dispatch an event from the queue. Extend with app-specific handlers."""
+        try:
+            if event_type == "emergency":
+                logger.critical(f"Handling emergency event: {payload}")
+                # Ensure movement is stopped and escalate state
+                self._stop_all_movement()
+                try:
+                    self.state_machine.transition_to(RobotState.ERROR, reason=str(payload))
+                except Exception:
+                    logger.debug("State transition on emergency failed or not implemented")
+            else:
+                logger.debug(f"Unhandled event '{event_type}' received with payload: {payload}")
+        except Exception:
+            logger.exception("Error while handling event")
+
+    def _perform_periodic_housekeeping(self) -> None:
+        """Perform periodic background tasks (health checks, telemetry)."""
+        # Minimal placeholder: call health service periodic hook if available.
+        try:
+            if hasattr(self.health_service, "perform_periodic_checks"):
+                self.health_service.perform_periodic_checks()
+        except Exception:
+            logger.debug("Periodic housekeeping hook failed or not implemented")
+
+    def _rollback_startup(self) -> None:
+        """Rollback partial startup by cleaning up registered resources."""
+        logger.warning("Rolling back startup and cleaning up resources")
+        try:
+            # Attempt best-effort cleanup of resources
+            self.lifecycle_manager.cleanup_all()
+        except Exception:
+            logger.exception("Rollback cleanup failed")
+        try:
+            self.state_machine.transition_to(RobotState.ERROR, reason="Startup rollback")
+        except Exception:
+            logger.debug("State transition to ERROR failed during rollback")
+        self._is_running = False
+
+    def _startup_server(self) -> bool:
+        """Start networking/server components required for runtime. Returns True on success."""
+        logger.info("Starting network/server components (placeholder)")
+        try:
+            if hasattr(self.network_service, "start"):
+                result = self.network_service.start()
+                # Some start() return None, some boolean; normalize to bool where possible
+                return True if result is None else bool(result)
+            return True
+        except Exception:
+            logger.exception("Failed to start network/server components")
+            return False
+
+    def _on_emergency_requested(self, reason: str) -> None:
+        """Callback when an emergency is requested by a subsystem."""
+        logger.critical(f"Emergency requested: {reason}")
+        # Enqueue to ensure the main loop processes escalation
+        try:
+            self._enqueue_event("emergency", reason)
+        except Exception:
+            logger.exception("Failed to enqueue emergency event")
 
     def _check_camera_available(self) -> bool:
         """Check if camera is available (placeholder)."""

@@ -82,7 +82,7 @@ TARGET_FPS = 15  # Cap display FPS
 # ============================================================================
 
 # Path to pest detection model
-MODEL_PATH = MODELS_DIR / "pest_model.pt"
+MODEL_PATH = MODELS_DIR / "pest_model.onnx"
 
 # Model inference parameters
 MODEL_CONFIDENCE_THRESHOLD = 0.5
