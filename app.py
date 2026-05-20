@@ -189,6 +189,118 @@ class RobotApplication:
             self._rollback_startup()
             return False
 
+    def _startup_network(self) -> bool:
+        """Initialize network connectivity or enter provisioning mode."""
+        self.state_machine.transition_to(
+            RobotState.WIFI_CONNECTING,
+            reason="Connecting to WiFi",
+        )
+        
+        # check if we already connected to wifi network
+        if self.wifi_manager.is_wifi_connected():
+            logger.info("Already connected to Wifi network")
+            return True
+        if self.network_service.has_network_connection():
+            logger.info("Has network connection already")
+            return True
+        if self.wifi_manager.connect_saved_networks():
+            logger.info("Connected to saved WiFi network")
+            return True
+
+        logger.info("No saved WiFi network available, entering provisioning mode")
+        if not self.hotspot_service.enter_provisioning_mode():
+            logger.error("WiFi provisioning failed")
+            return False
+
+        self._provisioning_active = True
+        self.state_machine.transition_to(
+            RobotState.HOTSPOT_MODE,
+            reason="WiFi provisioning active",
+        )
+        return True
+
+    def _startup_server(self) -> bool:
+        """Establish connection to the remote control server."""
+        self.state_machine.transition_to(
+            RobotState.SERVER_CONNECTING,
+            reason="Connecting to remote server",
+        )
+
+        if not self.network_service.connect_to_server():
+            logger.error("Remote server connection failed")
+            return False
+
+        logger.info("Connected to remote control server")
+        return True
+
+    def _startup_hardware(self) -> bool:
+        """Initialize Arduino and motor hardware."""
+        self.arduino = ArduinoConnection(
+            port=configs.ARDUINO_PORT,
+            baudrate=configs.ARDUINO_BAUDRATE,
+            timeout=configs.ARDUINO_TIMEOUT,
+            write_timeout=configs.ARDUINO_WRITE_TIMEOUT,
+        )
+
+        if not self.arduino.connect():
+            logger.error("Arduino connection failed")
+            return False
+
+        self.lifecycle_manager.register("arduino", self.arduino.disconnect)
+
+        self.motors = MotorController(self.arduino)
+        if not self.motors.initialize():
+            logger.error("Motor controller initialization failed")
+            return False
+
+        self.lifecycle_manager.register("motors", self._cleanup_motors)
+        return True
+
+    def _cleanup_motors(self) -> None:
+        if self.motors:
+            self.motors.stop()
+
+    def _startup_services(self) -> bool:
+        """Start camera, model, and watchdog services."""
+        self.state_machine.transition_to(
+            RobotState.CHECKING_SYSTEMS,
+            reason="Starting services and health checks",
+        )
+
+        try:
+            self.camera_service.start()
+            if not self.camera_service.wait_for_first_frame(timeout=5.0):
+                logger.error("Camera failed to provide a first frame")
+                return False
+            self.lifecycle_manager.register("camera", self.camera_service.stop)
+
+            self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
+            self.lifecycle_manager.register("model", self.model_service.stop_streaming)
+
+            self._register_watchdog_targets()
+            self.lifecycle_manager.register("watchdog", self.watchdog_service.stop)
+
+            return True
+        except Exception as exc:
+            logger.error(f"Service startup failed: {exc}")
+            return False
+
+    def _enqueue_event(self, event_type: str, payload: Optional[object] = None) -> None:
+        if self._shutdown_requested.is_set():
+            return
+        self._event_queue.put((event_type, payload))
+
+    def _handle_event(self, event_type: str, payload: Optional[object]) -> None:
+        if event_type == "emergency":
+            logger.warning(f"Processing emergency event: {payload}")
+            self.shutdown()
+        else:
+            logger.debug(f"Unhandled event type: {event_type}")
+
+    def _perform_periodic_housekeeping(self) -> None:
+        # Placeholder for periodic health checks or maintenance.
+        return
+
     def run(self) -> None:
         """
         Main robot operating loop.
@@ -269,6 +381,63 @@ class RobotApplication:
         except Exception:
             logger.exception("Error during shutdown")
 
+    def _rollback_startup(self) -> None:
+        """Rollback partially initialized resources after startup failure."""
+        logger.warning("Rolling back startup sequence")
+        self._shutdown_requested.set()
+        self._is_running = False
+        provisioning_was_active = self._provisioning_active
+        self._provisioning_active = False
+
+        try:
+            self._stop_all_movement("startup rollback")
+        except Exception as exc:
+            logger.error(f"Rollback failed to stop movement: {exc}")
+
+        try:
+            self.watchdog_service.stop()
+        except Exception as exc:
+            logger.error(f"Rollback failed to stop watchdog service: {exc}")
+
+        try:
+            self.model_service.stop_streaming()
+        except Exception as exc:
+            logger.error(f"Rollback failed to stop model service: {exc}")
+
+        try:
+            self.camera_service.stop()
+        except Exception as exc:
+            logger.error(f"Rollback failed to stop camera service: {exc}")
+
+        try:
+            self.network_service.disconnect()
+        except Exception as exc:
+            logger.error(f"Rollback failed to disconnect network service: {exc}")
+
+        try:
+            if self.arduino is not None:
+                self.arduino.disconnect()
+        except Exception as exc:
+            logger.error(f"Rollback failed to disconnect Arduino: {exc}")
+
+        try:
+            if provisioning_was_active:
+                self.hotspot_service.wifi_manager.stop_hotspot()
+        except Exception as exc:
+            logger.error(f"Rollback failed to stop hotspot provisioning: {exc}")
+
+        try:
+            self.lifecycle_manager.cleanup_all()
+        except Exception as exc:
+            logger.error(f"Rollback lifecycle cleanup failed: {exc}")
+
+        if self.state_machine.get_current_state() != RobotState.ERROR:
+            self.state_machine.transition_to(
+                RobotState.ERROR,
+                reason="Startup rollback",
+                error_message="Startup failed during initialization",
+            )
+
     def _handle_shutdown_signal(self, signum, frame):
         """Handle OS shutdown signals (SIGINT, SIGTERM)."""
         logger.info(f"Received signal {signum}, initiating shutdown...")
@@ -345,8 +514,8 @@ class RobotApplication:
             return False
         return self.arduino.reconnect_if_needed()
 
-    def _on_emergency_stop(self, reason: str) -> None:
-        logger.critical(f"Emergency stop callback invoked: {reason}")
+    def _on_emergency_requested(self, reason: str) -> None:
+        logger.critical(f"Emergency requested: {reason}")
         self._stop_all_movement()
         self.shutdown()
 
@@ -356,88 +525,22 @@ class RobotApplication:
             f"Watchdog failure ({target_name}): {message}"
         )
 
-    def _stop_all_movement(self) -> None:
+    def _stop_all_movement(self, reason: Optional[str] = None) -> None:
+        if reason:
+            logger.warning(f"Stopping all movement due to emergency: {reason}")
+        else:
+            logger.warning("Stopping all movement due to emergency")
+
         if self.motors:
             try:
-                logger.warning("Stopping motors due to emergency")
                 self.motors.stop()
             except Exception as exc:
                 logger.error(f"Failed to stop motors: {exc}")
         if self.arduino:
             try:
-                logger.warning("Sending emergency stop to Arduino")
                 self.arduino.send_emergency_stop()
             except Exception as exc:
                 logger.error(f"Emergency Arduino stop failed: {exc}")
-
-    # --- Helper methods (minimal, typed stubs to satisfy callers) ---
-    def _enqueue_event(self, event_type: str, payload: Optional[object] = None) -> None:
-        """Place an event onto the internal event queue."""
-        try:
-            self._event_queue.put((event_type, payload))
-        except Exception:
-            logger.exception("Failed to enqueue event")
-
-    def _handle_event(self, event_type: str, payload: Optional[object]) -> None:
-        """Dispatch an event from the queue. Extend with app-specific handlers."""
-        try:
-            if event_type == "emergency":
-                logger.critical(f"Handling emergency event: {payload}")
-                # Ensure movement is stopped and escalate state
-                self._stop_all_movement()
-                try:
-                    self.state_machine.transition_to(RobotState.ERROR, reason=str(payload))
-                except Exception:
-                    logger.debug("State transition on emergency failed or not implemented")
-            else:
-                logger.debug(f"Unhandled event '{event_type}' received with payload: {payload}")
-        except Exception:
-            logger.exception("Error while handling event")
-
-    def _perform_periodic_housekeeping(self) -> None:
-        """Perform periodic background tasks (health checks, telemetry)."""
-        # Minimal placeholder: call health service periodic hook if available.
-        try:
-            if hasattr(self.health_service, "perform_periodic_checks"):
-                self.health_service.perform_periodic_checks()
-        except Exception:
-            logger.debug("Periodic housekeeping hook failed or not implemented")
-
-    def _rollback_startup(self) -> None:
-        """Rollback partial startup by cleaning up registered resources."""
-        logger.warning("Rolling back startup and cleaning up resources")
-        try:
-            # Attempt best-effort cleanup of resources
-            self.lifecycle_manager.cleanup_all()
-        except Exception:
-            logger.exception("Rollback cleanup failed")
-        try:
-            self.state_machine.transition_to(RobotState.ERROR, reason="Startup rollback")
-        except Exception:
-            logger.debug("State transition to ERROR failed during rollback")
-        self._is_running = False
-
-    def _startup_server(self) -> bool:
-        """Start networking/server components required for runtime. Returns True on success."""
-        logger.info("Starting network/server components (placeholder)")
-        try:
-            if hasattr(self.network_service, "start"):
-                result = self.network_service.start()
-                # Some start() return None, some boolean; normalize to bool where possible
-                return True if result is None else bool(result)
-            return True
-        except Exception:
-            logger.exception("Failed to start network/server components")
-            return False
-
-    def _on_emergency_requested(self, reason: str) -> None:
-        """Callback when an emergency is requested by a subsystem."""
-        logger.critical(f"Emergency requested: {reason}")
-        # Enqueue to ensure the main loop processes escalation
-        try:
-            self._enqueue_event("emergency", reason)
-        except Exception:
-            logger.exception("Failed to enqueue emergency event")
 
     def _check_camera_available(self) -> bool:
         """Check if camera is available (placeholder)."""

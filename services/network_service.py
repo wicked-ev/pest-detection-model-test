@@ -55,6 +55,22 @@ class NetworkService:
             self._is_connected = False
             return False
         
+    def has_network_connection(self,host="8.8.8.8",port=53,timeout=3,) -> bool:
+            """
+            Check if internet/network access exists.
+
+            Uses a socket connection to Google's DNS server.
+            """
+            try:
+                socket.setdefaulttimeout(timeout)
+
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.connect((host, port))
+                    sock.close()
+                return True
+
+            except OSError:
+                return False
     def connect_to_server(self) -> bool:
         """Attempt to connect to the remote control server."""
         logger.info(f"Connecting to control server at {self.server_url}")

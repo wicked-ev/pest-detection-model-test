@@ -93,6 +93,20 @@ class WiFiManager:
                 return False                        
         return True
 
+    def is_wifi_connected(self, interface="wlan0") -> bool:
+
+        try:
+            result = subprocess.run([
+                ["iwgetid", interface, "--raw"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                ])
+            ssid = result.stdout.strip()
+            return bool(ssid)
+        except subprocess.CalledProcessError:
+            return False
+    
     def connect_saved_networks(self) -> bool:
         """Attempt to connect to previously saved WiFi credentials."""
         credentials = self.load_saved_credentials()
