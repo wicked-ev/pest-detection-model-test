@@ -34,6 +34,8 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 LOG_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 CONFIG_DIR.mkdir(exist_ok=True)
+MODELS_DIR.mkdir(exist_ok=True)
+SAMPLES_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
 # ARDUINO SERIAL CONFIGURATION
@@ -83,6 +85,11 @@ TARGET_FPS = 15  # Cap display FPS
 
 # Path to pest detection model
 MODEL_PATH = MODELS_DIR / "pest_model.onnx"
+
+# Default download URLs for model assets (override via env vars)
+# These should point to stable, versioned releases in production.
+MODEL_DOWNLOAD_URL = os.getenv("MODEL_DOWNLOAD_URL", "https://example.com/assets/model.onnx")
+ANNOTATIONS_DOWNLOAD_URL = os.getenv("ANNOTATIONS_DOWNLOAD_URL", "https://example.com/assets/_annotations.coco.json")
 
 # Model inference parameters
 MODEL_CONFIDENCE_THRESHOLD = 0.5

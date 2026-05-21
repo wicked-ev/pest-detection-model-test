@@ -60,6 +60,7 @@ from services.wifi_service import WiFiManager, HotspotProvisioningService
 from services.network_service import NetworkService
 from services.camera_service import CameraService
 from services.model_service import ModelService
+from services.asset_manager import AssetManager
 
 
 class RobotApplication:
@@ -104,6 +105,8 @@ class RobotApplication:
         self.emergency_service.register_callback(self._stop_all_movement)
         self.emergency_service.register_callback(self._on_emergency_requested)
         self.watchdog_service.register_failure_callback(self._on_watchdog_failure)
+        # Asset manager: ensure model assets before starting model service
+        self.asset_manager = AssetManager()
         
         # Lifecycle
         self._event_queue: Queue[Tuple[str, Optional[object]]] = Queue()
@@ -268,6 +271,12 @@ class RobotApplication:
         )
 
         try:
+            # Ensure model assets are present and valid before starting services
+            logger.info("Checking model assets before service startup")
+            if not self.asset_manager.ensure_assets():
+                logger.error("Required model assets are missing or invalid")
+                return False
+
             self.camera_service.start()
             if not self.camera_service.wait_for_first_frame(timeout=5.0):
                 logger.error("Camera failed to provide a first frame")
