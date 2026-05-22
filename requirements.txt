@@ -1,4 +1,5 @@
 opencv-python-headless>=4.5
 numpy>=1.21
+tflite-runtime>=2.11.0
 onnxruntime
 requests>=2.32.5

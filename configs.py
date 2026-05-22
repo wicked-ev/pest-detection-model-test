@@ -83,12 +83,24 @@ TARGET_FPS = 15  # Cap display FPS
 # AI DETECTION MODEL
 # ============================================================================
 
-# Path to pest detection model
-MODEL_PATH = MODELS_DIR / "pest_model.onnx"
+# Model backend preference and selection.
+# Use MODEL_BACKEND to force a specific backend, otherwise fall back through the preference list.
+MODEL_BACKEND = os.getenv("MODEL_BACKEND", "tflite").lower()
+_RAW_BACKEND_PREFERENCE = os.getenv("MODEL_BACKEND_PREFERENCE", "")
+if _RAW_BACKEND_PREFERENCE:
+    MODEL_BACKEND_PREFERENCE = [item.strip().lower() for item in _RAW_BACKEND_PREFERENCE.split(",") if item.strip()]
+else:
+    _default_backends = ["tflite", "onnx"]
+    MODEL_BACKEND_PREFERENCE = [MODEL_BACKEND] + [item for item in _default_backends if item != MODEL_BACKEND]
+
+# Primary model path for Raspberry Pi inference.
+MODEL_PATH = MODELS_DIR / os.getenv("MODEL_FILENAME", "pest_model.tflite")
+ONNX_MODEL_PATH = MODELS_DIR / os.getenv("ONNX_MODEL_FILENAME", "pest_model.onnx")
 
 # Default download URLs for model assets (override via env vars)
 # These should point to stable, versioned releases in production.
-MODEL_DOWNLOAD_URL = os.getenv("MODEL_DOWNLOAD_URL", "https://example.com/assets/model.onnx")
+MODEL_DOWNLOAD_URL = os.getenv("MODEL_DOWNLOAD_URL", "https://example.com/assets/model.tflite")
+ONNX_MODEL_DOWNLOAD_URL = os.getenv("ONNX_MODEL_DOWNLOAD_URL", "https://example.com/assets/model.onnx")
 ANNOTATIONS_DOWNLOAD_URL = os.getenv("ANNOTATIONS_DOWNLOAD_URL", "https://example.com/assets/_annotations.coco.json")
 
 # Model inference parameters

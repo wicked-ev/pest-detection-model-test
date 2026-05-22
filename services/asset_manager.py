@@ -28,8 +28,10 @@ class AssetManager:
     def __init__(self, download_service: Optional[DownloadService] = None):
         self.download_service = download_service or DownloadService()
         self.model_path: Path = Path(configs.MODEL_PATH)
+        self.onnx_model_path: Path = Path(configs.ONNX_MODEL_PATH)
         self.annotations_path: Path = Path(configs.MODEL_PATH).with_name("_annotations.coco.json")
         self.model_url = configs.MODEL_DOWNLOAD_URL
+        self.onnx_model_url = configs.ONNX_MODEL_DOWNLOAD_URL
         self.annotations_url = configs.ANNOTATIONS_DOWNLOAD_URL
 
     def _validate_json(self, path: Path) -> bool:
@@ -46,13 +48,30 @@ class AssetManager:
             logger.warning("onnxruntime not available; skipping ONNX validation")
             return True
         try:
-            # try to create a lightweight session
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             _ = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
             return True
         except Exception:
             logger.exception("ONNX validation failed for %s", path)
+            return False
+
+    def _validate_tflite(self, path: Path) -> bool:
+        try:
+            from tflite_runtime.interpreter import Interpreter as TFLiteInterpreter
+        except Exception:
+            try:
+                from tensorflow.lite import Interpreter as TFLiteInterpreter
+            except Exception:
+                logger.warning("TensorFlow Lite runtime unavailable; skipping TFLite validation")
+                return True
+
+        try:
+            interpreter = TFLiteInterpreter(model_path=str(path))
+            interpreter.allocate_tensors()
+            return True
+        except Exception:
+            logger.exception("TFLite validation failed for %s", path)
             return False
 
     def _is_valid_file(self, path: Path, kind: str) -> bool:
@@ -69,21 +88,23 @@ class AssetManager:
 
         if kind == "annotations":
             return self._validate_json(path)
-        if kind == "model":
+        if kind == "tflite":
+            return self._validate_tflite(path)
+        if kind == "onnx":
             return self._validate_onnx(path)
         return True
 
     def ensure_assets(self) -> bool:
-        """Ensure model and annotation files exist and are valid. Returns True when assets are ready."""
-        # Model
-        if not self._is_valid_file(self.model_path, "model"):
-            logger.info("Model missing or invalid, downloading from %s", self.model_url)
+        """Ensure required model and annotation files exist and are valid."""
+        primary_kind = "tflite" if self.model_path.suffix.lower() == ".tflite" else "onnx"
+        if not self._is_valid_file(self.model_path, primary_kind):
+            logger.info("Primary model missing or invalid, downloading from %s", self.model_url)
             try:
                 self.download_service.download(self.model_url, self.model_path)
             except DownloadError as exc:
                 logger.error("Model download failed: %s", exc)
                 return False
-            if not self._is_valid_file(self.model_path, "model"):
+            if not self._is_valid_file(self.model_path, primary_kind):
                 logger.error("Model validation failed after download")
                 try:
                     self.model_path.unlink()
@@ -91,7 +112,10 @@ class AssetManager:
                     logger.exception("Failed to remove invalid model file")
                 return False
 
-        # Annotations
+        if self.onnx_model_path != self.model_path and self.onnx_model_path.exists():
+            if not self._is_valid_file(self.onnx_model_path, "onnx"):
+                logger.warning("Optional ONNX fallback model exists but is invalid: %s", self.onnx_model_path)
+
         if not self._is_valid_file(self.annotations_path, "annotations"):
             logger.info("Annotations missing or invalid, downloading from %s", self.annotations_url)
             try:
