@@ -114,7 +114,7 @@ MODEL_IOU_THRESHOLD = 0.45
 # WebSocket server for remote control
 SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
 SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
-SERVER_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}"
+SERVER_URL = f"{SERVER_HOST}:{SERVER_PORT}"
 
 # Network retry logic
 NETWORK_RETRY_ATTEMPTS = 3

@@ -135,12 +135,12 @@ class RobotApplication:
         self.lifecycle_manager = LifecycleManager()
 
         try:
-            if not self.state_machine.transition_to(
-                RobotState.BOOTING,
-                reason="Startup initiated",
-            ):
-                logger.error("Failed to enter BOOTING state")
-                return False
+            # if not self.state_machine.transition_to(
+            #     RobotState.BOOTING,
+            #     reason="Startup initiated",
+            # ):
+            #     logger.error("Failed to enter BOOTING state")
+            #     return False
 
             logger.info("\n[1/4] PHASE: BOOTING")
             logger.info("-" * 70)

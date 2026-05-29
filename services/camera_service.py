@@ -28,6 +28,15 @@ import configs
 
 logger = logging.getLogger(__name__)
 
+# Optional Picamera2 support for Raspberry Pi Camera Module 3 (libcamera)
+PICAMERA2_AVAILABLE = False
+Picamera2 = None
+try:
+    from picamera2 import Picamera2
+    PICAMERA2_AVAILABLE = True
+except Exception:
+    Picamera2 = None
+
 
 @dataclass
 class CameraConfig:
@@ -38,6 +47,7 @@ class CameraConfig:
     buffer_size: int = 1  # keep only the newest frame
     frame_format: str = "bgr"  # or 'rgb'
     read_timeout: float = 3.0  # seconds to wait for a first frame
+    use_picamera2: Optional[bool] = None  # None = auto-detect, True/False to force
 
     def __post_init__(self) -> None:
         if not isinstance(self.device, int) or self.device < 0:
@@ -54,6 +64,8 @@ class CameraConfig:
             raise ValueError(f"Camera frame_format must be 'bgr' or 'rgb', got {self.frame_format}")
         if not isinstance(self.read_timeout, (int, float)) or self.read_timeout <= 0:
             raise ValueError(f"Camera read_timeout must be positive, got {self.read_timeout}")
+        if self.use_picamera2 is not None and not isinstance(self.use_picamera2, bool):
+            raise ValueError(f"use_picamera2 must be a bool or None, got {self.use_picamera2}")
 
 
 class CameraService:
@@ -69,6 +81,12 @@ class CameraService:
     def __init__(self, config: Optional[CameraConfig] = None):
         self.config = config or CameraConfig()
         self._capture: Optional[cv2.VideoCapture] = None
+        self._picam = None
+        # Determine whether to use picamera2: user override or auto-detect
+        if self.config.use_picamera2 is None:
+            self._use_picamera2 = PICAMERA2_AVAILABLE
+        else:
+            self._use_picamera2 = bool(self.config.use_picamera2) and PICAMERA2_AVAILABLE
         self._capture_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -77,9 +95,39 @@ class CameraService:
         self._latest_ts: Optional[float] = None
         self._latest_frame_id: int = 0
         self._opened = False
+        # internal flag: frames stored internally are BGR (for OpenCV compatibility)
+        self._frame_is_rgb = False
 
     def _open_capture(self) -> bool:
         logger.info(f"Opening camera device {self.config.device}")
+        # Prefer Picamera2 on Raspberry Pi Camera Module 3 when available
+        if self._use_picamera2 and PICAMERA2_AVAILABLE:
+            try:
+                picam = Picamera2()
+                cfg = picam.create_preview_configuration({'size': (int(self.config.width), int(self.config.height))})
+                picam.configure(cfg)
+                picam.start()
+                with self._capture_lock:
+                    self._picam = picam
+                    self._capture = None
+                    self._opened = True
+                # Picamera2 provides RGB frames; convert to BGR on capture for internal consistency
+                self._frame_is_rgb = True
+                return True
+            except Exception:
+                logger.exception("Picamera2 failed to open, falling back to cv2.VideoCapture")
+                try:
+                    if self._picam:
+                        self._picam.stop()
+                        try:
+                            self._picam.close()
+                        except Exception:
+                            pass
+                        self._picam = None
+                except Exception:
+                    pass
+
+        # Fallback to OpenCV VideoCapture (v4l2)
         cap = cv2.VideoCapture(self.config.device)
         if not cap.isOpened():
             logger.warning("cv2.VideoCapture failed to open")
@@ -96,6 +144,7 @@ class CameraService:
         with self._capture_lock:
             self._capture = cap
             self._opened = True
+        self._frame_is_rgb = False
         return True
 
     def start(self) -> None:
@@ -116,6 +165,19 @@ class CameraService:
                 except Exception:
                     pass
                 self._capture = None
+            if hasattr(self, "_picam") and self._picam:
+                try:
+                    try:
+                        self._picam.stop()
+                    except Exception:
+                        pass
+                    try:
+                        self._picam.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                self._picam = None
         self._opened = False
 
     def _capture_loop(self) -> None:
@@ -124,8 +186,9 @@ class CameraService:
         while not self._stop_event.is_set():
             with self._capture_lock:
                 cap = self._capture
+                picam = getattr(self, "_picam", None)
                 opened = self._opened
-            if not cap or not opened:
+            if (not cap and not picam) or not opened:
                 now = time.time()
                 if now - last_open_attempt < backoff:
                     time.sleep(0.05)
@@ -139,22 +202,55 @@ class CameraService:
                 backoff = 0.5
                 with self._capture_lock:
                     cap = self._capture
-            if cap is None:
-                continue
+                    picam = getattr(self, "_picam", None)
             try:
-                # read is usually blocking and efficient in native code
-                success, frame = cap.read()
-                if not success or frame is None:
-                    logger.warning("Camera read failure, attempting reconnect")
+                # Capture from Picamera2 if available
+                if picam is not None:
                     try:
-                        cap.release()
-                    except Exception:
-                        pass
-                    with self._capture_lock:
-                        self._capture = None
-                        self._opened = False
-                    time.sleep(0.1)
-                    continue
+                        frame = picam.capture_array()
+                        if frame is None:
+                            raise RuntimeError("picamera2 returned no frame")
+                        # picamera2 returns RGB by default; convert to BGR for internal consistency
+                        try:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        logger.exception("Picamera2 read failure, attempting reconnect: %s", exc)
+                        with self._capture_lock:
+                            try:
+                                picam.stop()
+                            except Exception:
+                                pass
+                            try:
+                                picam.close()
+                            except Exception:
+                                pass
+                            self._picam = None
+                            self._opened = False
+                        time.sleep(0.1)
+                        continue
+
+                else:
+                    if cap is None:
+                        continue
+                    try:
+                        success, frame = cap.read()
+                    except Exception as exc:
+                        logger.exception("Camera read exception: %s", exc)
+                        success = False
+                        frame = None
+                    if not success or frame is None:
+                        logger.warning("Camera read failure, attempting reconnect")
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+                        with self._capture_lock:
+                            self._capture = None
+                            self._opened = False
+                        time.sleep(0.1)
+                        continue
 
                 # Store frame reference to single-slot buffer; avoid copies
                 with self._frame_lock:
@@ -185,7 +281,42 @@ class CameraService:
         logger.info("Camera capture thread stopped")
 
     def is_available(self) -> bool:
-        # quick non-blocking probe: try to open and read a single frame
+        # quick non-blocking probe: prefer picamera2 when configured and available
+        if (self.config.use_picamera2 is None and PICAMERA2_AVAILABLE) or self.config.use_picamera2:
+            if PICAMERA2_AVAILABLE:
+                try:
+                    picam = Picamera2()
+                    cfg = picam.create_preview_configuration({'size': (int(self.config.width), int(self.config.height))})
+                    picam.configure(cfg)
+                    picam.start()
+                    t0 = time.time()
+                    while time.time() - t0 < self.config.read_timeout:
+                        try:
+                            frame = picam.capture_array()
+                            if frame is not None:
+                                try:
+                                    picam.stop()
+                                except Exception:
+                                    pass
+                                try:
+                                    picam.close()
+                                except Exception:
+                                    pass
+                                return True
+                        except Exception:
+                            time.sleep(0.05)
+                    try:
+                        picam.stop()
+                    except Exception:
+                        pass
+                    try:
+                        picam.close()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        # Fallback to OpenCV VideoCapture probe
         probe_cap = cv2.VideoCapture(self.config.device)
         try:
             if not probe_cap.isOpened():
@@ -233,7 +364,7 @@ class CameraService:
             if self._latest_frame is None:
                 return None
             frame = self._latest_frame
-            timestamp = float(self._latest_ts)
+            timestamp = float(self._latest_ts) if self._latest_ts is not None else 0.0
         if self.config.frame_format == "rgb":
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             if copy:
@@ -249,7 +380,7 @@ class CameraService:
             if self._latest_frame is None:
                 return None
             frame = self._latest_frame
-            timestamp = float(self._latest_ts)
+            timestamp = float(self._latest_ts) if self._latest_ts is not None else 0.0
             frame_id = self._latest_frame_id
         if self.config.frame_format == "rgb":
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
