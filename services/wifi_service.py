@@ -96,12 +96,12 @@ class WiFiManager:
     def is_wifi_connected(self, interface="wlan0") -> bool:
 
         try:
-            result = subprocess.run([
+            result = subprocess.run(
                 ["iwgetid", interface, "--raw"],
                     capture_output=True,
                     text=True,
                     timeout=2,
-                ])
+                )
             ssid = result.stdout.strip()
             return bool(ssid)
         except subprocess.CalledProcessError:
