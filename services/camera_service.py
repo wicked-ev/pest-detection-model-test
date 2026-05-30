@@ -20,9 +20,14 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from pathlib import Path
+import select
+import os
 
 import numpy as np
-from picamera2 import Picamera2
+try:
+    import v4l2capture
+except ImportError:
+    v4l2capture = None
 
 import configs
 
@@ -35,8 +40,8 @@ class CameraConfig:
     width: int = 640
     height: int = 480
     fps: int = 30
-    buffer_size: int = 1  # keep only the newest frame (Picamera2 only uses latest)
-    frame_format: str = "rgb"  # Picamera2 natively provides RGB frames
+    buffer_size: int = 1  # keep only the newest frame
+    frame_format: str = "rgb"  # camera frames are converted to RGB for consistency
     read_timeout: float = 3.0  # seconds to wait for a first frame
 
     def __post_init__(self) -> None:
@@ -56,6 +61,91 @@ class CameraConfig:
             raise ValueError(f"Camera read_timeout must be positive, got {self.read_timeout}")
 
 
+class V4L2Capture:
+    def __init__(
+        self,
+        device: int,
+        width: int,
+        height: int,
+        fps: int,
+        buffer_count: int,
+    ) -> None:
+        self.device_path = f"/dev/video{device}"
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.buffer_count = max(1, buffer_count)
+        self.video = None
+        self.pixfmt: Optional[str] = None
+
+    def open(self) -> None:
+        if v4l2capture is None:
+            raise ImportError("The v4l2capture package is required for V4L2 camera capture")
+
+        self.video = v4l2capture.Video_device(self.device_path)
+        try:
+            self.video.set_format(self.width, self.height, fourcc="RGB3")
+            self.pixfmt = "RGB3"
+        except Exception:
+            self.video.set_format(self.width, self.height, fourcc="YUYV")
+            self.pixfmt = "YUYV"
+
+        try:
+            self.video.set_fps(self.fps)
+        except Exception:
+            pass
+
+        self.video.create_buffers(self.buffer_count)
+        self.video.queue_all_buffers()
+        self.video.start()
+
+    def read(self) -> np.ndarray:
+        if self.video is None:
+            raise RuntimeError("V4L2 capture is not open")
+        raw = self.video.read()
+        if raw is None:
+            raise RuntimeError("V4L2 capture returned no data")
+        if self.pixfmt == "RGB3":
+            return np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
+        return self._decode_yuyv(raw)
+
+    def fileno(self) -> int:
+        if self.video is None:
+            raise RuntimeError("V4L2 capture is not open")
+        return self.video.fileno()
+
+    def close(self) -> None:
+        if self.video is None:
+            return
+        try:
+            self.video.close()
+        except Exception:
+            pass
+        self.video = None
+
+    def _decode_yuyv(self, raw: bytes) -> np.ndarray:
+        yuyv = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width // 2, 4))
+        y0 = yuyv[:, :, 0].astype(np.int16)
+        u = yuyv[:, :, 1].astype(np.int16) - 128
+        y1 = yuyv[:, :, 2].astype(np.int16)
+        v = yuyv[:, :, 3].astype(np.int16) - 128
+
+        rgb0 = self._yuv_to_rgb(y0, u, v)
+        rgb1 = self._yuv_to_rgb(y1, u, v)
+
+        rgb = np.empty((self.height, self.width, 3), dtype=np.uint8)
+        rgb[:, 0::2, :] = rgb0
+        rgb[:, 1::2, :] = rgb1
+        return rgb
+
+    def _yuv_to_rgb(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        r = y + (1.3707 * v)
+        g = y - (0.3376 * u) - (0.6980 * v)
+        b = y + (1.7324 * u)
+        rgb = np.stack((r, g, b), axis=2)
+        return np.clip(rgb, 0, 255).astype(np.uint8)
+
+
 class CameraService:
     """Camera service providing a low-latency newest-frame buffer.
 
@@ -68,8 +158,8 @@ class CameraService:
 
     def __init__(self, config: Optional[CameraConfig] = None):
         self.config = config or CameraConfig()
-        self._picam: Optional["Picamera2"] = None
-        self._picam_lock = threading.Lock()
+        self._capture: Optional[V4L2Capture] = None
+        self._capture_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
@@ -80,27 +170,22 @@ class CameraService:
 
     def _open_capture(self) -> bool:
         logger.info(f"Opening camera device {self.config.device}")
+        capture = V4L2Capture(
+            device=int(self.config.device),
+            width=int(self.config.width),
+            height=int(self.config.height),
+            fps=int(self.config.fps),
+            buffer_count=max(1, int(self.config.buffer_size)),
+        )
         try:
-            picam = Picamera2()
-            cfg = picam.create_preview_configuration({'size': (int(self.config.width), int(self.config.height))})
-            picam.configure(cfg)
-            picam.start()
-            with self._picam_lock:
-                self._picam = picam
+            capture.open()
+            with self._capture_lock:
+                self._capture = capture
                 self._opened = True
             return True
         except Exception:
-            logger.exception("Picamera2 failed to open")
-            try:
-                if self._picam:
-                    self._picam.stop()
-                    try:
-                        self._picam.close()
-                    except Exception:
-                        pass
-                    self._picam = None
-            except Exception:
-                pass
+            logger.exception("V4L2 capture failed to open")
+            capture.close()
             return False
 
     def start(self) -> None:
@@ -114,30 +199,23 @@ class CameraService:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout)
-        with self._picam_lock:
-            if self._picam:
+        with self._capture_lock:
+            if self._capture:
                 try:
-                    try:
-                        self._picam.stop()
-                    except Exception:
-                        pass
-                    try:
-                        self._picam.close()
-                    except Exception:
-                        pass
+                    self._capture.close()
                 except Exception:
                     pass
-                self._picam = None
+                self._capture = None
         self._opened = False
 
     def _capture_loop(self) -> None:
         backoff = 0.5
         last_open_attempt = 0.0
         while not self._stop_event.is_set():
-            with self._picam_lock:
-                picam = self._picam
+            with self._capture_lock:
+                capture = self._capture
                 opened = self._opened
-            if not picam or not opened:
+            if not capture or not opened:
                 now = time.time()
                 if now - last_open_attempt < backoff:
                     time.sleep(0.05)
@@ -149,16 +227,15 @@ class CameraService:
                     backoff = min(5.0, backoff * 1.5)
                     continue
                 backoff = 0.5
-                with self._picam_lock:
-                    picam = self._picam
-            if picam is None:
+                with self._capture_lock:
+                    capture = self._capture
+            if capture is None:
                 continue
             try:
-                # Capture from Picamera2 (always returns RGB frames)
-                frame = picam.capture_array()
+                frame = capture.read()
                 if frame is None:
-                    raise RuntimeError("picamera2 returned no frame")
-                
+                    raise RuntimeError("V4L2 capture returned no frame")
+
                 # Store frame reference to single-slot buffer; avoid copies
                 with self._frame_lock:
                     self._latest_frame = frame
@@ -167,69 +244,51 @@ class CameraService:
 
             except Exception as exc:  # defensive: do not let thread die
                 logger.exception("Camera capture loop exception: %s", exc)
-                with self._picam_lock:
-                    if self._picam:
+                with self._capture_lock:
+                    if self._capture:
                         try:
-                            self._picam.stop()
+                            self._capture.close()
                         except Exception:
                             pass
-                        try:
-                            self._picam.close()
-                        except Exception:
-                            pass
-                        self._picam = None
+                        self._capture = None
                         self._opened = False
                 time.sleep(0.5)
 
         # cleanup when stopping
-        with self._picam_lock:
-            if self._picam:
+        with self._capture_lock:
+            if self._capture:
                 try:
-                    self._picam.stop()
+                    self._capture.close()
                 except Exception:
                     pass
-                try:
-                    self._picam.close()
-                except Exception:
-                    pass
-                self._picam = None
+                self._capture = None
         logger.info("Camera capture thread stopped")
 
     def is_available(self) -> bool:
-        """Quick non-blocking probe: try to open Picamera2 and read a single frame."""
+        """Quick non-blocking probe: try to open V4L2 and read a single frame."""
+        capture = V4L2Capture(
+            device=int(self.config.device),
+            width=int(self.config.width),
+            height=int(self.config.height),
+            fps=int(self.config.fps),
+            buffer_count=max(1, int(self.config.buffer_size)),
+        )
         try:
-            picam = Picamera2()
-            cfg = picam.create_preview_configuration({'size': (int(self.config.width), int(self.config.height))})
-            picam.configure(cfg)
-            picam.start()
-            t0 = time.time()
-            while time.time() - t0 < self.config.read_timeout:
-                try:
-                    frame = picam.capture_array()
-                    if frame is not None:
-                        try:
-                            picam.stop()
-                        except Exception:
-                            pass
-                        try:
-                            picam.close()
-                        except Exception:
-                            pass
-                        return True
-                except Exception:
-                    time.sleep(0.05)
+            capture.open()
             try:
-                picam.stop()
+                ready, _, _ = select.select((capture.fileno(),), (), (), self.config.read_timeout)
+                if not ready:
+                    return False
             except Exception:
                 pass
-            try:
-                picam.close()
-            except Exception:
-                pass
-            return False
+
+            frame = capture.read()
+            return frame is not None
         except Exception:
-            logger.debug("Picamera2 availability check failed", exc_info=True)
+            logger.debug("Camera availability check failed", exc_info=True)
             return False
+        finally:
+            capture.close()
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and self._opened
@@ -253,7 +312,7 @@ class CameraService:
     def get_latest(self, copy: bool = False) -> Optional[Tuple[np.ndarray, float]]:
         """Return (frame, timestamp) of the newest frame or None.
 
-        Frames are always in RGB format (Picamera2 native format).
+        Frames are always in RGB format.
         If `copy` is True a deep copy of the frame is returned. For lowest
         latency and memory use, keep `copy=False` and treat the returned
         numpy array as read-only.
@@ -270,7 +329,7 @@ class CameraService:
     def get_latest_metadata(self, copy: bool = False) -> Optional[tuple[np.ndarray, float, int]]:
         """Return (frame, timestamp, frame_id) for the newest frame or None.
         
-        Frames are always in RGB format (Picamera2 native format).
+        Frames are always in RGB format.
         """
         with self._frame_lock:
             if self._latest_frame is None:
