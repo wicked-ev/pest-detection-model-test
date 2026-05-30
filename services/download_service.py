@@ -131,5 +131,3 @@ class DownloadService:
                 wait = max(0.5, backoff + jitter)
                 logger.info("Retrying in %.1f seconds... (attempt %d/%d)", wait, attempt, self.max_retries)
                 time.sleep(wait)
-
-*** End Patch
