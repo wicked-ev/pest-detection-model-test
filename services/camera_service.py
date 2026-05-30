@@ -9,30 +9,150 @@ Responsibilities:
 Design notes:
 - A single-frame slot (latest frame) is used to avoid queue buildup and copies.
 - A short-grace reconnect loop prevents dead capture streams from stalling.
+- V4L2 capture is implemented using raw ioctl calls (fcntl + mmap + numpy only).
+  No external packages (v4l2capture, cv2, picamera2) are required.
 """
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import logging
+import mmap
+import os
+import select
+import struct
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
-from pathlib import Path
-import select
-import os
-
 import numpy as np
-try:
-    import v4l2capture
-except ImportError:
-    v4l2capture = None
 
 import configs
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# V4L2 ioctl constants and structures
+# ---------------------------------------------------------------------------
+
+# ioctl request codes
+_IOC_NONE = 0
+_IOC_WRITE = 1
+_IOC_READ = 2
+
+def _IOC(dir_, type_, nr, size):
+    return (dir_ << 30) | (size << 16) | (ord(type_) << 8) | nr
+
+def _IOWR(type_, nr, size):
+    return _IOC(_IOC_READ | _IOC_WRITE, type_, nr, size)
+
+def _IOW(type_, nr, size):
+    return _IOC(_IOC_WRITE, type_, nr, size)
+
+def _IOR(type_, nr, size):
+    return _IOC(_IOC_READ, type_, nr, size)
+
+# fourcc helpers
+def _fourcc(a, b, c, d):
+    return ord(a) | (ord(b) << 8) | (ord(c) << 16) | (ord(d) << 24)
+
+V4L2_PIX_FMT_RGB24 = _fourcc('R', 'G', 'B', '3')
+V4L2_PIX_FMT_YUYV  = _fourcc('Y', 'U', 'Y', 'V')
+
+V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+V4L2_MEMORY_MMAP             = 1
+V4L2_FIELD_ANY               = 0
+
+# struct sizes (ARM 32-bit / armhf)
+_FMT_SIZE     = 204   # struct v4l2_format
+_REQBUF_SIZE  = 24    # struct v4l2_requestbuffers
+_BUF_SIZE     = 88    # struct v4l2_buffer
+
+# ioctl numbers
+VIDIOC_S_FMT       = _IOWR('V', 5,  _FMT_SIZE)
+VIDIOC_REQBUFS     = _IOWR('V', 8,  _REQBUF_SIZE)
+VIDIOC_QUERYBUF    = _IOWR('V', 9,  _BUF_SIZE)
+VIDIOC_QBUF        = _IOWR('V', 15, _BUF_SIZE)
+VIDIOC_DQBUF       = _IOWR('V', 17, _BUF_SIZE)
+VIDIOC_STREAMON    = _IOW ('V', 18, 4)
+VIDIOC_STREAMOFF   = _IOW ('V', 19, 4)
+
+
+def _ioctl(fd, request, buf):
+    """Wrapper around fcntl.ioctl that raises OSError on failure."""
+    return fcntl.ioctl(fd, request, buf, True)
+
+
+def _set_format(fd, width, height, pixfmt):
+    """Send VIDIOC_S_FMT; returns (actual_width, actual_height, actual_pixfmt)."""
+    # struct v4l2_format layout for VIDEO_CAPTURE on ARM 32-bit:
+    # u32 type (4), then v4l2_pix_format starting at offset 4:
+    #   u32 width, u32 height, u32 pixelformat, u32 field,
+    #   u32 bytesperline, u32 sizeimage, v4l2_colorspace colorspace,
+    #   u32 priv, u32 flags, ...  pad to 200 bytes
+    buf = bytearray(_FMT_SIZE)
+    struct.pack_into('IIIII', buf, 0,
+                     V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                     width, height, pixfmt, V4L2_FIELD_ANY)
+    _ioctl(fd, VIDIOC_S_FMT, buf)
+    _, aw, ah, apf = struct.unpack_from('IIII', buf, 0)
+    return aw, ah, apf
+
+
+def _request_buffers(fd, count):
+    """Send VIDIOC_REQBUFS; returns granted buffer count."""
+    buf = bytearray(_REQBUF_SIZE)
+    struct.pack_into('III', buf, 0, count, V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_MMAP)
+    _ioctl(fd, VIDIOC_REQBUFS, buf)
+    granted, = struct.unpack_from('I', buf, 0)
+    return granted
+
+
+def _query_buffer(fd, index):
+    """Send VIDIOC_QUERYBUF; returns (offset, length)."""
+    buf = bytearray(_BUF_SIZE)
+    struct.pack_into('III', buf, 0, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_MMAP)
+    _ioctl(fd, VIDIOC_QUERYBUF, buf)
+    # length at offset 24, m.offset at offset 32 (union, first member)
+    length, = struct.unpack_from('I', buf, 24)
+    offset, = struct.unpack_from('I', buf, 32)
+    return offset, length
+
+
+def _queue_buffer(fd, index):
+    buf = bytearray(_BUF_SIZE)
+    struct.pack_into('III', buf, 0, index, V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_MEMORY_MMAP)
+    _ioctl(fd, VIDIOC_QBUF, buf)
+
+
+def _dequeue_buffer(fd):
+    """Send VIDIOC_DQBUF; returns buffer index."""
+    buf = bytearray(_BUF_SIZE)
+    struct.pack_into('II', buf, 0, 0, V4L2_BUF_TYPE_VIDEO_CAPTURE)
+    _ioctl(fd, VIDIOC_DQBUF, buf)
+    index, = struct.unpack_from('I', buf, 0)
+    return index
+
+
+def _stream_on(fd):
+    buf = struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE)
+    _ioctl(fd, VIDIOC_STREAMON, bytearray(buf))
+
+
+def _stream_off(fd):
+    buf = struct.pack('I', V4L2_BUF_TYPE_VIDEO_CAPTURE)
+    try:
+        _ioctl(fd, VIDIOC_STREAMOFF, bytearray(buf))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
 class CameraConfig:
@@ -40,9 +160,9 @@ class CameraConfig:
     width: int = 640
     height: int = 480
     fps: int = 30
-    buffer_size: int = 1  # keep only the newest frame
-    frame_format: str = "rgb"  # camera frames are converted to RGB for consistency
-    read_timeout: float = 3.0  # seconds to wait for a first frame
+    buffer_size: int = 2        # number of mmap buffers (min 2 recommended)
+    frame_format: str = "rgb"
+    read_timeout: float = 3.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.device, int) or self.device < 0:
@@ -61,90 +181,130 @@ class CameraConfig:
             raise ValueError(f"Camera read_timeout must be positive, got {self.read_timeout}")
 
 
+# ---------------------------------------------------------------------------
+# Raw V4L2 capture (no external packages)
+# ---------------------------------------------------------------------------
+
 class V4L2Capture:
-    def __init__(
-        self,
-        device: int,
-        width: int,
-        height: int,
-        fps: int,
-        buffer_count: int,
-    ) -> None:
+    """Low-level V4L2 capture using only fcntl + mmap + numpy."""
+
+    def __init__(self, device: int, width: int, height: int, fps: int, buffer_count: int) -> None:
         self.device_path = f"/dev/video{device}"
         self.width = width
         self.height = height
         self.fps = fps
-        self.buffer_count = max(1, buffer_count)
-        self.video = None
-        self.pixfmt: Optional[str] = None
+        self.buffer_count = max(2, buffer_count)
+        self._fd: Optional[int] = None
+        self._mmaps: list[mmap.mmap] = []
+        self._pixfmt: Optional[int] = None
 
     def open(self) -> None:
-        if v4l2capture is None:
-            raise ImportError("The v4l2capture package is required for V4L2 camera capture")
-
-        self.video = v4l2capture.Video_device(self.device_path)
+        self._fd = os.open(self.device_path, os.O_RDWR | os.O_NONBLOCK)
         try:
-            self.video.set_format(self.width, self.height, fourcc="RGB3")
-            self.pixfmt = "RGB3"
+            self._setup()
         except Exception:
-            self.video.set_format(self.width, self.height, fourcc="YUYV")
-            self.pixfmt = "YUYV"
+            os.close(self._fd)
+            self._fd = None
+            raise
 
-        try:
-            self.video.set_fps(self.fps)
-        except Exception:
-            pass
+    def _setup(self) -> None:
+        fd = self._fd
 
-        self.video.create_buffers(self.buffer_count)
-        self.video.queue_all_buffers()
-        self.video.start()
+        # Try RGB24 first, fall back to YUYV
+        for pixfmt in (V4L2_PIX_FMT_RGB24, V4L2_PIX_FMT_YUYV):
+            try:
+                aw, ah, apf = _set_format(fd, self.width, self.height, pixfmt)
+                self._pixfmt = apf
+                self.width = aw
+                self.height = ah
+                logger.debug("Camera format set: %dx%d pixfmt=0x%x", aw, ah, apf)
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("Could not set RGB24 or YUYV format on camera")
 
-    def read(self) -> np.ndarray:
-        if self.video is None:
-            raise RuntimeError("V4L2 capture is not open")
-        raw = self.video.read()
-        if raw is None:
-            raise RuntimeError("V4L2 capture returned no data")
-        if self.pixfmt == "RGB3":
-            return np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
-        return self._decode_yuyv(raw)
+        # Request mmap buffers
+        granted = _request_buffers(fd, self.buffer_count)
+        if granted < 1:
+            raise RuntimeError(f"Kernel granted 0 buffers (asked for {self.buffer_count})")
+
+        # Map each buffer into Python
+        self._mmaps = []
+        for i in range(granted):
+            offset, length = _query_buffer(fd, i)
+            mm = mmap.mmap(fd, length, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE, offset=offset)
+            self._mmaps.append(mm)
+            _queue_buffer(fd, i)
+
+        _stream_on(fd)
 
     def fileno(self) -> int:
-        if self.video is None:
+        if self._fd is None:
             raise RuntimeError("V4L2 capture is not open")
-        return self.video.fileno()
+        return self._fd
+
+    def read(self) -> np.ndarray:
+        if self._fd is None:
+            raise RuntimeError("V4L2 capture is not open")
+
+        idx = _dequeue_buffer(self._fd)
+        mm = self._mmaps[idx]
+        mm.seek(0)
+
+        if self._pixfmt == V4L2_PIX_FMT_RGB24:
+            raw = mm.read(self.height * self.width * 3)
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
+        else:
+            raw = mm.read(self.height * self.width * 2)
+            frame = self._decode_yuyv(raw)
+
+        _queue_buffer(self._fd, idx)
+        return frame
 
     def close(self) -> None:
-        if self.video is None:
+        if self._fd is None:
             return
+        _stream_off(self._fd)
+        for mm in self._mmaps:
+            try:
+                mm.close()
+            except Exception:
+                pass
+        self._mmaps = []
         try:
-            self.video.close()
+            os.close(self._fd)
         except Exception:
             pass
-        self.video = None
+        self._fd = None
+
+    # ------------------------------------------------------------------
+    # YUYV → RGB conversion (pure numpy, no cv2)
+    # ------------------------------------------------------------------
 
     def _decode_yuyv(self, raw: bytes) -> np.ndarray:
         yuyv = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width // 2, 4))
         y0 = yuyv[:, :, 0].astype(np.int16)
-        u = yuyv[:, :, 1].astype(np.int16) - 128
+        u  = yuyv[:, :, 1].astype(np.int16) - 128
         y1 = yuyv[:, :, 2].astype(np.int16)
-        v = yuyv[:, :, 3].astype(np.int16) - 128
-
-        rgb0 = self._yuv_to_rgb(y0, u, v)
-        rgb1 = self._yuv_to_rgb(y1, u, v)
+        v  = yuyv[:, :, 3].astype(np.int16) - 128
 
         rgb = np.empty((self.height, self.width, 3), dtype=np.uint8)
-        rgb[:, 0::2, :] = rgb0
-        rgb[:, 1::2, :] = rgb1
+        rgb[:, 0::2, :] = self._yuv_to_rgb(y0, u, v)
+        rgb[:, 1::2, :] = self._yuv_to_rgb(y1, u, v)
         return rgb
 
-    def _yuv_to_rgb(self, y: np.ndarray, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _yuv_to_rgb(y, u, v) -> np.ndarray:
         r = y + (1.3707 * v)
         g = y - (0.3376 * u) - (0.6980 * v)
         b = y + (1.7324 * u)
-        rgb = np.stack((r, g, b), axis=2)
-        return np.clip(rgb, 0, 255).astype(np.uint8)
+        return np.clip(np.stack((r, g, b), axis=2), 0, 255).astype(np.uint8)
 
+
+# ---------------------------------------------------------------------------
+# CameraService  (unchanged public API)
+# ---------------------------------------------------------------------------
 
 class CameraService:
     """Camera service providing a low-latency newest-frame buffer.
@@ -175,7 +335,7 @@ class CameraService:
             width=int(self.config.width),
             height=int(self.config.height),
             fps=int(self.config.fps),
-            buffer_count=max(1, int(self.config.buffer_size)),
+            buffer_count=max(2, int(self.config.buffer_size)),
         )
         try:
             capture.open()
@@ -232,17 +392,24 @@ class CameraService:
             if capture is None:
                 continue
             try:
-                frame = capture.read()
-                if frame is None:
-                    raise RuntimeError("V4L2 capture returned no frame")
+                # Wait for frame ready (non-blocking fd)
+                ready, _, _ = select.select([capture.fileno()], [], [], self.config.read_timeout)
+                if not ready:
+                    logger.warning("Camera read timeout, reconnecting")
+                    with self._capture_lock:
+                        if self._capture:
+                            self._capture.close()
+                            self._capture = None
+                            self._opened = False
+                    continue
 
-                # Store frame reference to single-slot buffer; avoid copies
+                frame = capture.read()
                 with self._frame_lock:
                     self._latest_frame = frame
                     self._latest_ts = time.time()
                     self._latest_frame_id += 1
 
-            except Exception as exc:  # defensive: do not let thread die
+            except Exception as exc:
                 logger.exception("Camera capture loop exception: %s", exc)
                 with self._capture_lock:
                     if self._capture:
@@ -254,7 +421,6 @@ class CameraService:
                         self._opened = False
                 time.sleep(0.5)
 
-        # cleanup when stopping
         with self._capture_lock:
             if self._capture:
                 try:
@@ -265,23 +431,18 @@ class CameraService:
         logger.info("Camera capture thread stopped")
 
     def is_available(self) -> bool:
-        """Quick non-blocking probe: try to open V4L2 and read a single frame."""
         capture = V4L2Capture(
             device=int(self.config.device),
             width=int(self.config.width),
             height=int(self.config.height),
             fps=int(self.config.fps),
-            buffer_count=max(1, int(self.config.buffer_size)),
+            buffer_count=2,
         )
         try:
             capture.open()
-            try:
-                ready, _, _ = select.select((capture.fileno(),), (), (), self.config.read_timeout)
-                if not ready:
-                    return False
-            except Exception:
-                pass
-
+            ready, _, _ = select.select([capture.fileno()], [], [], self.config.read_timeout)
+            if not ready:
+                return False
             frame = capture.read()
             return frame is not None
         except Exception:
@@ -313,9 +474,7 @@ class CameraService:
         """Return (frame, timestamp) of the newest frame or None.
 
         Frames are always in RGB format.
-        If `copy` is True a deep copy of the frame is returned. For lowest
-        latency and memory use, keep `copy=False` and treat the returned
-        numpy array as read-only.
+        If `copy` is True a deep copy of the frame is returned.
         """
         with self._frame_lock:
             if self._latest_frame is None:
@@ -327,10 +486,7 @@ class CameraService:
         return (frame, timestamp)
 
     def get_latest_metadata(self, copy: bool = False) -> Optional[tuple[np.ndarray, float, int]]:
-        """Return (frame, timestamp, frame_id) for the newest frame or None.
-        
-        Frames are always in RGB format.
-        """
+        """Return (frame, timestamp, frame_id) for the newest frame or None."""
         with self._frame_lock:
             if self._latest_frame is None:
                 return None
@@ -342,11 +498,7 @@ class CameraService:
         return (frame, timestamp, frame_id)
 
     def test_mode(self, run_seconds: float = 5.0, save_debug_frame: Optional[Path] = None) -> None:
-        """Run a lightweight capture test printing FPS and optionally saving a frame.
-
-        This method runs independently (blocking) and is safe to use without
-        the model service. It helps validate camera health and basic timing.
-        """
+        """Run a lightweight capture test printing FPS and optionally saving a frame."""
         logger.info("Starting camera test mode")
         self.start()
         try:
@@ -366,16 +518,13 @@ class CameraService:
                 frames_since_report += 1
                 if save_debug_frame and not saved:
                     try:
-                        # Try PIL (Pillow) first for image format support
                         try:
                             from PIL import Image
-                            # Frame is RGB numpy array; convert to PIL Image and save
                             img = Image.fromarray(frame.astype(np.uint8), mode='RGB')
                             img.save(str(save_debug_frame))
                             saved = True
                             logger.info("Saved debug frame to %s (via PIL)", save_debug_frame)
                         except ImportError:
-                            # Fallback to numpy binary format
                             np.save(str(save_debug_frame), frame)
                             saved = True
                             logger.info("Saved debug frame to %s (numpy format)", save_debug_frame)
@@ -390,7 +539,8 @@ class CameraService:
                 time.sleep(0.001)
 
             elapsed = max(1e-6, time.time() - start)
-            logger.info("Camera test complete: frames=%d elapsed=%.2fs fps=%.2f", frames, elapsed, frames / elapsed)
+            logger.info("Camera test complete: frames=%d elapsed=%.2fs fps=%.2f",
+                        frames, elapsed, frames / elapsed)
         finally:
             self.stop()
 
@@ -403,7 +553,6 @@ class CameraService:
 
 
 if __name__ == "__main__":
-    # simple smoke test when run directly
     logging.basicConfig(level=logging.INFO)
     cam = CameraService()
     try:
