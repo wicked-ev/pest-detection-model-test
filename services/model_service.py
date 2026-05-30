@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
+from PIL import Image
 
 import configs
 from .inference_backend import BackendFactory, BaseInferenceBackend, Detection
@@ -137,7 +137,11 @@ class ModelService:
 
         img: Optional[np.ndarray] = None
         if sample_image and sample_image.exists():
-            img = cv2.imread(str(sample_image))
+            try:
+                pil_img = Image.open(str(sample_image)).convert('RGB')
+                img = np.array(pil_img)
+            except Exception:
+                logger.exception("Failed to load image from file: %s", sample_image)
 
         if img is None:
             from services.camera_service import CameraService, CameraConfig

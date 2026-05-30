@@ -8,8 +8,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
+from PIL import Image
 
 import configs
 
@@ -238,8 +238,10 @@ class TFLiteBackend(BaseInferenceBackend):
         target_h, target_w = self._input_shape
         image = frame
         if image.shape[:2] != (target_h, target_w):
-            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(image.astype(np.uint8), mode='RGB')
+            pil_img = pil_img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            image = np.array(pil_img)
+        # Frame is already RGB from camera/PIL; no BGR->RGB conversion needed
 
         if self._input_dtype == np.float32:
             image = image.astype(np.float32) / 255.0
@@ -353,8 +355,10 @@ class ONNXBackend(BaseInferenceBackend):
         target_h, target_w = self._input_shape
         image = frame
         if image.shape[:2] != (target_h, target_w):
-            image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(image.astype(np.uint8), mode='RGB')
+            pil_img = pil_img.resize((target_w, target_h), Image.Resampling.BILINEAR)
+            image = np.array(pil_img)
+        # Frame is already RGB from camera/PIL; no BGR->RGB conversion needed
         image = image.astype(np.float32) / 255.0
         tensor = np.transpose(image, (2, 0, 1))[None, :, :, :]
         return np.ascontiguousarray(tensor, dtype=np.float32)
