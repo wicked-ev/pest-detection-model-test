@@ -2,6 +2,12 @@
 
 This service selects the best available backend based on configuration and
 runs inference on a dedicated thread while dispatching detection callbacks.
+
+The service uses an enhanced fallback architecture that:
+- Tries inference backends in preference order
+- Caches successful backend selection to avoid repeated startup penalties
+- Supports multiple backend types (TFLite, ONNX, Remote)
+- Provides clean error handling and recovery
 """
 
 from __future__ import annotations
@@ -15,17 +21,29 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
 
 import configs
-from .inference_backend import BackendFactory, BaseInferenceBackend, Detection
+from .inference_backends import (
+    BaseInferenceBackend,
+    Detection,
+    InferenceBackendFactory,
+    InferenceBackendConfig,
+)
 
 logger = logging.getLogger(__name__)
 Listener = Callable[[List[Detection]], None]
 
 
 class ModelService:
-    """Unified model service that selects and runs an inference backend."""
+    """Unified model service that selects and runs an inference backend.
+    
+    Features:
+    - Automatic backend selection with fallback strategy
+    - Backend selection caching to avoid startup delays
+    - Streaming inference on dedicated thread
+    - Detection event dispatching to listeners
+    - Graceful shutdown and error recovery
+    """
 
     def __init__(
         self,
@@ -35,20 +53,43 @@ class ModelService:
         confidence_threshold: Optional[float] = None,
         num_threads: int = 1,
         backend_preference: Optional[Sequence[str]] = None,
+        cache_dir: Optional[Path] = None,
     ):
+        """Initialize the model service.
+        
+        Args:
+            model_path: Path to TFLite model (defaults from configs)
+            onnx_model_path: Path to ONNX model (defaults from configs)
+            annotations_path: Path to COCO annotations JSON
+            confidence_threshold: Detection confidence threshold
+            num_threads: Number of inference threads
+            backend_preference: Backend selection order (e.g., ["tflite", "onnx"])
+            cache_dir: Directory for caching backend selection
+        """
         self.model_path = Path(model_path) if model_path is not None else Path(configs.MODEL_PATH)
         self.onnx_model_path = Path(onnx_model_path) if onnx_model_path is not None else Path(configs.ONNX_MODEL_PATH)
         self.annotations_path = Path(annotations_path) if annotations_path is not None else self.model_path.with_name("_annotations.coco.json")
         self.confidence_threshold = float(confidence_threshold) if confidence_threshold is not None else float(configs.MODEL_CONFIDENCE_THRESHOLD)
-        self.backend_preference = [item.strip().lower() for item in backend_preference] if backend_preference is not None else configs.MODEL_BACKEND_PREFERENCE
-        self._backend_candidates = BackendFactory.create_backends(
-            self.backend_preference,
+        self.backend_preference = (
+            [item.strip().lower() for item in backend_preference]
+            if backend_preference is not None
+            else configs.MODEL_BACKEND_PREFERENCE
+        )
+        
+        # Setup cache directory for backend selection
+        self._cache_dir = Path(cache_dir) if cache_dir is not None else Path(configs.OUTPUT_DIR)
+        self._backend_cache_path = self._cache_dir / ".backend_cache.json"
+        
+        # Create backend configuration
+        self._backend_config = InferenceBackendConfig(
             model_path=self.model_path,
             onnx_model_path=self.onnx_model_path,
             annotations_path=self.annotations_path,
             confidence_threshold=self.confidence_threshold,
             num_threads=num_threads,
+            backend_preference=self.backend_preference,
         )
+        
         self._backend: Optional[BaseInferenceBackend] = None
         self._listeners: List[Listener] = []
         self._executor = ThreadPoolExecutor(max_workers=2)
@@ -59,32 +100,31 @@ class ModelService:
         self._streaming_active = False
 
     def get_backend_name(self) -> Optional[str]:
+        """Get the name of the currently selected backend."""
         return self._backend.name if self._backend is not None else None
 
     def load_model(self) -> bool:
-        last_error: Optional[str] = None
-        for backend in self._backend_candidates:
-            if not backend.is_available():
-                logger.warning("Skipping unavailable backend: %s", backend.name)
-                continue
-            logger.info("Attempting to load model on backend: %s", backend.name)
-            if backend.load_model():
-                self._backend = backend
-                logger.info("Selected inference backend: %s", backend.name)
-                return True
-            last_error = f"Backend {backend.name} failed to load"
-            logger.warning(last_error)
-
-        if last_error:
-            logger.error("No inference backend could be loaded: %s", last_error)
-        else:
-            logger.error("No available inference backend selected")
-        return False
+        """Load the inference model using backend selection with fallback strategy.
+        
+        Uses factory to:
+        1. Check cache for previously successful backend
+        2. Try each backend in preference order until one succeeds
+        3. Cache the successful selection for next startup
+        
+        Returns True if a backend was successfully loaded, False otherwise.
+        """
+        self._backend = InferenceBackendFactory.select_best_backend(
+            self._backend_config,
+            cache_path=self._backend_cache_path,
+        )
+        return self._backend is not None
 
     def verify_load(self) -> bool:
+        """Verify model is loaded. Alias for load_model() for compatibility."""
         return self.load_model()
 
     def add_listener(self, fn: Listener) -> None:
+        """Add a detection event listener."""
         self._listeners.append(fn)
 
     def _reset_executor(self) -> None:
