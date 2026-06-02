@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 class NetworkService:
     """Abstraction for remote server connectivity."""
 
-    def __init__(self, server_url: Optional[str] = None):
+    def __init__(self, 
+                 server_url: Optional[str] = None, 
+                 server_connection_attempts: int = 25, 
+                 connection_retry_delay: float = 2.0):
         self.server_url = server_url or configs.SERVER_URL
         self.server_host = configs.SERVER_HOST
         self.server_port = configs.SERVER_PORT
+        self.server_connection_attempts = server_connection_attempts
+        self.connection_retry_delay = connection_retry_delay
         self.client: Optional[socket_obj] = None
         self._server_socket: Optional[socket_obj] = None
         self._is_connected = False
@@ -74,25 +79,29 @@ class NetworkService:
     def connect_to_server(self) -> bool:
         """Attempt to connect to the remote control server."""
         logger.info(f"Connecting to control server at {self.server_url}")
+        for attempt in range(1, self.server_connection_attempts):
+            try:
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.settimeout(10.0)
+                client_socket.connect((self.server_host, self.server_port))
 
-        try:
-            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(10.0)
-            client_socket.connect((self.server_host, self.server_port))
-
-            self.client = client_socket
-            self._is_connected = True
-            logger.info(
-                f"Connected to remote control server at {self.server_host}:{self.server_port}"
-            )
-            return True
-        except (OSError, socket.error) as exc:
-            logger.error(
-                f"Error connecting to remote control server {self.server_host}:{self.server_port}: {exc}"
-            )
-            self._is_connected = False
-            self.client = None
-            return False
+                self.client = client_socket
+                self._is_connected = True
+                logger.info(f"Connected on attempt {attempt}/{self.server_connection_attempts}")
+                logger.info(
+                    f"Connected to remote control server at {self.server_host}:{self.server_port}"
+                )
+                return True
+            except (OSError, socket.error) as exc:
+                logger.warning(
+                f"Attempt {attempt}/{self.server_connection_attempts} failed: {exc}"
+                )
+                if attempt < self.server_connection_attempts:
+                    time.sleep(self.server_connection_attempts)
+            
+        self._is_connected = False
+        self.client = None
+        return False
 
 
     def disconnect(self) -> bool:
