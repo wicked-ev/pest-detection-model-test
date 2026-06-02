@@ -22,6 +22,7 @@ All other modules should be independent and testable.
 
 import os
 import sys
+import json
 import logging
 import signal
 import time
@@ -99,6 +100,7 @@ class RobotApplication:
         self.network_service = NetworkService()
         self.camera_service = CameraService()
         self.model_service = ModelService()
+        self.model_service.add_listener(self._on_detection)
         self.emergency_service = EmergencyStopService()
         self.watchdog_service = WatchdogService()
 
@@ -114,6 +116,7 @@ class RobotApplication:
         self._shutdown_started = False
         self._provisioning_active = False
         self._is_running = False
+        self._last_housekeeping_ts = 0.0
         
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
@@ -283,6 +286,30 @@ class RobotApplication:
                 return False
             self.lifecycle_manager.register("camera", self.camera_service.stop)
 
+            camera_check = self.health_service.check_camera(
+                lambda: self.camera_service.get_latest(copy=False) is not None
+            )
+            if camera_check.status != HealthCheckStatus.OK:
+                logger.error("Camera health check failed")
+                return False
+
+            if not self.model_service.load_model():
+                model_check = self.health_service.check_ai_model(
+                    str(self.model_service.model_path),
+                    self.model_service.load_model,
+                )
+                if model_check.status != HealthCheckStatus.OK:
+                    logger.error("AI model health check failed")
+                    return False
+            else:
+                model_check = self.health_service.check_ai_model(
+                    str(self.model_service.model_path),
+                    self.model_service.load_model,
+                )
+                if model_check.status != HealthCheckStatus.OK:
+                    logger.error("AI model health check failed")
+                    return False
+
             self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
             self.lifecycle_manager.register("model", self.model_service.stop_streaming)
 
@@ -303,12 +330,41 @@ class RobotApplication:
         if event_type == "emergency":
             logger.warning(f"Processing emergency event: {payload}")
             self.shutdown()
+        elif event_type == "detection":
+            logger.info("Processing detection event")
+            detections = payload if isinstance(payload, list) else []
+            self._send_telemetry({
+                "type": "detection",
+                "detections": detections,
+                "state": self.state_machine.get_current_state().value,
+            })
+            if self.state_machine.is_ready():
+                self.state_machine.transition_to(
+                    RobotState.DETECTING,
+                    reason="Object detected",
+                )
+            return
+        elif event_type == "diagnostics":
+            self.print_diagnostics()
+            return
         else:
             logger.debug(f"Unhandled event type: {event_type}")
 
     def _perform_periodic_housekeeping(self) -> None:
-        # Placeholder for periodic health checks or maintenance.
-        return
+        now = time.time()
+        if now - self._last_housekeeping_ts < 10.0:
+            return
+        self._last_housekeeping_ts = now
+
+        if self.network_service.is_connected():
+            self._send_telemetry({
+                "type": "heartbeat",
+                "state": self.state_machine.get_current_state().value,
+                "timestamp": time.time(),
+            })
+        self._check_camera_watchdog()
+        self._check_model_watchdog()
+        self._check_arduino_watchdog()
 
     def run(self) -> None:
         """
@@ -332,6 +388,8 @@ class RobotApplication:
             while not self._shutdown_requested.is_set():
                 if self.emergency_service.is_engaged():
                     self._enqueue_event("emergency", self.emergency_service.reason())
+
+                self._process_network_messages()
 
                 try:
                     event_type, payload = self._event_queue.get(timeout=0.5)
@@ -451,6 +509,128 @@ class RobotApplication:
         """Handle OS shutdown signals (SIGINT, SIGTERM)."""
         logger.info(f"Received signal {signum}, initiating shutdown...")
         self._shutdown_requested.set()
+
+    def _process_network_messages(self) -> None:
+        if not self.network_service.is_connected():
+            return
+
+        try:
+            message = self.network_service.receive_message_with_timeout(timeout=0.1)
+        except Exception as exc:
+            logger.debug(f"Error reading remote command: {exc}")
+            return
+
+        if not message:
+            return
+
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            logger.warning("Received malformed remote command")
+            return
+
+        self._process_remote_command(payload)
+
+    def _on_detection(self, detections: list) -> None:
+        logger.info("Detection callback received %d detections", len(detections))
+        self._enqueue_event("detection", detections)
+
+    def _process_remote_command(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            logger.warning("Remote command payload must be a JSON object")
+            return
+
+        command = str(payload.get("command", "")).strip().lower()
+        if not command:
+            logger.warning("Remote command missing 'command' field")
+            return
+
+        if command == "move":
+            direction = str(payload.get("direction", "stop")).strip().lower()
+            direction_map = {
+                "forward": MovementDirection.FORWARD,
+                "backward": MovementDirection.BACKWARD,
+                "left": MovementDirection.LEFT,
+                "right": MovementDirection.RIGHT,
+                "stop": MovementDirection.STOP,
+            }
+            if direction not in direction_map:
+                logger.warning(f"Unsupported move direction: {direction}")
+                return
+            self._execute_movement(direction_map[direction])
+            return
+
+        if command in {"stop", "halt", "pause"}:
+            self._execute_movement(MovementDirection.STOP)
+            return
+
+        if command == "status":
+            self._send_telemetry({
+                "type": "status",
+                "status": self._build_status_payload(),
+            })
+            return
+
+        if command == "diagnostics":
+            self._enqueue_event("diagnostics", None)
+            return
+
+        logger.warning(f"Unknown remote command: {command}")
+
+    def _execute_movement(self, direction: MovementDirection) -> None:
+        if self.motors is None:
+            logger.error("Cannot execute movement: motor controller unavailable")
+            return
+
+        if direction != MovementDirection.STOP and not self.state_machine.can_move() and not self.state_machine.is_ready():
+            logger.warning("Ignoring movement command because robot is not ready")
+            return
+
+        if direction == MovementDirection.STOP:
+            self.motors.stop()
+            if self.state_machine.is_in_state(RobotState.DETECTING):
+                self.state_machine.transition_to(
+                    RobotState.READY,
+                    reason="Stopped from detection",
+                )
+            return
+
+        if self.motors.move(direction):
+            if self.state_machine.is_ready():
+                self.state_machine.transition_to(
+                    RobotState.REMOTE_CONTROL,
+                    reason=f"Remote move {direction.value}",
+                )
+        else:
+            logger.error(f"Failed to execute movement: {direction.value}")
+
+    def _send_telemetry(self, payload: dict) -> None:
+        if not self.network_service.is_connected():
+            return
+        try:
+            self.network_service.send_message(payload)
+        except Exception as exc:
+            logger.warning(f"Failed to send telemetry: {exc}")
+
+    def _build_status_payload(self) -> dict:
+        payload = {
+            "state": self.state_machine.get_current_state().value,
+            "emergency": self.emergency_service.is_engaged(),
+        }
+        if self.motors:
+            status = self.motors.get_status()
+            if status:
+                payload.update({
+                    "motor_health": status.is_healthy,
+                    "motors_moving": status.is_moving,
+                    "motor_speeds": [
+                        status.motor_0_speed,
+                        status.motor_1_speed,
+                        status.motor_2_speed,
+                        status.motor_3_speed,
+                    ],
+                })
+        return payload
 
     def _handle_check_failure(self, result) -> None:
         """Log and record health check failures."""

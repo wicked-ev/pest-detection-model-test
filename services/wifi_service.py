@@ -43,7 +43,7 @@ class WiFiManager:
             logger.debug("No saved WiFi credentials found")
             return None
 
-        wifiCredentials: list[WiFiCredentials] = [] 
+        wifiCredentials: list[WiFiCredentials] = []
         try:
             data = json.loads(self.credentials_path.read_text())
 
@@ -55,7 +55,7 @@ class WiFiManager:
                 ssid = item.get("ssid", "").strip()
                 password = item.get("password", "").strip()
 
-                if not ssid or not password:
+                if not ssid:
                     logger.warning(f"Skipping invalid WiFi credential: {item}")
                     continue
 
@@ -63,7 +63,7 @@ class WiFiManager:
                     WiFiCredentials(ssid=ssid, password=password)
                 )
 
-                return wifiCredentials
+            return wifiCredentials
 
         except (json.JSONDecodeError, OSError) as exc:
             logger.error(f"Failed to read saved WiFi credentials: {exc}")
@@ -73,7 +73,9 @@ class WiFiManager:
         """Persist WiFi credentials for future startup attempts."""
         try:
             self.credentials_path.write_text(
-                json.dumps({"ssid": credentials.ssid, "password": credentials.password}, indent=2)
+                json.dumps([
+                    {"ssid": credentials.ssid, "password": credentials.password}
+                ], indent=2)
             )
             logger.info(f"Saved WiFi credentials to {self.credentials_path}")
             return True
@@ -83,14 +85,13 @@ class WiFiManager:
 
     def validate_credentials(self, credentials: list[WiFiCredentials]) -> bool:
         """Validate credentials shape before using them."""
-        #TODO: add support for empty passwords
         for credential in credentials:
             if not credential.ssid:
-                logger.warning("WIFI SSID is empty")
+                logger.warning("WiFi SSID is empty")
                 return False
-            if not credential.password:
-                logger.warning("WiFi password is empty")
-                return False                        
+            if credential.password is None:
+                logger.warning("WiFi password value is missing")
+                return False
         return True
 
     def is_wifi_connected(self, interface="wlan0") -> bool:
@@ -117,26 +118,28 @@ class WiFiManager:
         return self.connect(credentials)
 
     def connect(self, credentials: list[WiFiCredentials]) -> bool:
-        """Attempt to connect to a WiFi network.
-        """
+        """Attempt to connect to a WiFi network."""
         if not self.validate_credentials(credentials):
             return False
 
         for credential in credentials:
             logger.info(f"Attempting WiFi connection to SSID '{credential.ssid}'")
+            cmd = [
+                "nmcli",
+                "device",
+                "wifi",
+                "connect",
+                credential.ssid,
+            ]
+            if credential.password:
+                cmd.extend([credential.password])
+
             try:
-                subprocess.run([
-                    "nmcli",
-                    "device",
-                    "wifi",
-                    "connect",
-                    credential.ssid,
-                    credential.password       
-                ], check=True)
+                subprocess.run(cmd, check=True)
                 return True
             except subprocess.CalledProcessError:
-                logger.error(f"Error connecting to SSID: ${credential.ssid}")
-                return False
+                logger.error(f"Error connecting to SSID: {credential.ssid}")
+                continue
         return False
 
     def start_hotspot(self) -> bool:
