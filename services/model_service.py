@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import io
+import base64
+from typing import Any
 
 import configs
 from .inference_backends import (
@@ -98,6 +101,10 @@ class ModelService:
         self._last_inference_ts: Optional[float] = None
         self._last_frame_id: Optional[int] = None
         self._streaming_active = False
+        # Remote streaming (fallback) state
+        self._remote_thread: Optional[threading.Thread] = None
+        self._remote_stop_event = threading.Event()
+        self._remote_streaming_active = False
 
     def get_backend_name(self) -> Optional[str]:
         """Get the name of the currently selected backend."""
@@ -144,7 +151,9 @@ class ModelService:
                 logger.exception("Listener submit failed")
 
     def is_streaming(self) -> bool:
-        return self._inference_thread is not None and self._inference_thread.is_alive() and self._streaming_active
+        local_ok = self._inference_thread is not None and self._inference_thread.is_alive() and self._streaming_active
+        remote_ok = self._remote_thread is not None and self._remote_thread.is_alive() and self._remote_streaming_active
+        return local_ok or remote_ok
 
     def get_last_inference_age(self) -> Optional[float]:
         if self._last_inference_ts is None:
@@ -154,6 +163,97 @@ class ModelService:
     def restart_streaming(self, camera_service, throttle_fps: Optional[float] = None) -> None:
         self.stop_streaming()
         self.start_streaming(camera_service, throttle_fps)
+
+    def start_remote_streaming(self, camera_service, network_service: Any, throttle_fps: Optional[float] = None) -> None:
+        """Stream encoded frames to remote server for server-side inference.
+
+        Frames are JPEG-encoded and sent as base64 within JSON messages. This
+        method is intended as a fallback when local model assets or backends
+        are unavailable.
+        """
+        if self._remote_thread and self._remote_thread.is_alive():
+            return
+
+        # network_service must be connected
+        if not getattr(network_service, "is_connected", lambda: False)():
+            raise RuntimeError("Network service is not connected for remote streaming")
+
+        self._remote_stop_event.clear()
+        self._remote_streaming_active = True
+
+        def encode_frame_to_jpeg_b64(frame: np.ndarray) -> str:
+            try:
+                from PIL import Image
+                img = Image.fromarray(frame.astype(np.uint8), mode="RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=80)
+                return base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception:
+                try:
+                    import cv2
+                    _, jpeg = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                    return base64.b64encode(jpeg.tobytes()).decode('ascii')
+                except Exception:
+                    logger.exception("Failed to encode frame to JPEG for remote streaming")
+                    return ""
+
+        def loop() -> None:
+            min_frame_interval = 1.0 / throttle_fps if throttle_fps else 0.0
+            last_sent = 0.0
+            last_frame_id: Optional[int] = None
+            frame_counter = 0
+            while not self._remote_stop_event.is_set():
+                try:
+                    res = camera_service.get_latest_metadata(copy=False)
+                except AttributeError:
+                    res = camera_service.get_latest(copy=False)
+
+                if res is None:
+                    time.sleep(0.005)
+                    continue
+
+                if len(res) == 3:
+                    frame, ts, frame_id = res
+                else:
+                    frame, ts = res
+                    frame_id = None
+
+                if frame_id is not None and last_frame_id is not None and frame_id == last_frame_id:
+                    time.sleep(0.005)
+                    continue
+
+                last_frame_id = frame_id
+                frame_counter += 1
+                if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
+                    continue
+
+                if min_frame_interval and (time.time() - last_sent) < min_frame_interval:
+                    time.sleep(0.001)
+                    continue
+
+                last_sent = time.time()
+                try:
+                    b64 = encode_frame_to_jpeg_b64(frame)
+                    if not b64:
+                        continue
+                    payload = {
+                        "type": "frame",
+                        "format": "jpeg",
+                        "frame_b64": b64,
+                        "timestamp": ts,
+                        "frame_id": frame_id,
+                    }
+                    try:
+                        network_service.send_message(payload)
+                    except Exception:
+                        logger.exception("Failed to send remote frame payload")
+                except Exception:
+                    logger.exception("Remote streaming loop encountered an error")
+
+            logger.info("Remote streaming stopped")
+
+        self._remote_thread = threading.Thread(target=loop, name="remote-stream", daemon=True)
+        self._remote_thread.start()
 
     def _ensure_backend(self) -> BaseInferenceBackend:
         if self._backend is None:
@@ -178,8 +278,14 @@ class ModelService:
         img: Optional[np.ndarray] = None
         if sample_image and sample_image.exists():
             try:
-                pil_img = Image.open(str(sample_image)).convert('RGB')
-                img = np.array(pil_img)
+                try:
+                    from PIL import Image
+                    pil_img = Image.open(str(sample_image)).convert('RGB')
+                    img = np.array(pil_img)
+                except Exception:
+                    # PIL not available or failed; fall back to numpy load where possible
+                    pil_img = None
+                    img = None
             except Exception:
                 logger.exception("Failed to load image from file: %s", sample_image)
 
@@ -272,11 +378,22 @@ class ModelService:
         self._inference_thread.start()
 
     def stop_streaming(self, timeout: float = 2.0) -> None:
-        self._stop_event.set()
-        if self._inference_thread:
-            self._inference_thread.join(timeout)
-        self._streaming_active = False
-        self._reset_executor()
+        # Stop local inference streaming
+        try:
+            self._stop_event.set()
+            if self._inference_thread:
+                self._inference_thread.join(timeout)
+        finally:
+            self._streaming_active = False
+            self._reset_executor()
+
+        # Stop remote streaming if active
+        try:
+            self._remote_stop_event.set()
+            if self._remote_thread:
+                self._remote_thread.join(timeout)
+        finally:
+            self._remote_streaming_active = False
 
 
 if __name__ == "__main__":

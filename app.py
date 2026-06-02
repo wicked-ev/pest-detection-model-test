@@ -276,9 +276,10 @@ class RobotApplication:
         try:
             # Ensure model assets are present and valid before starting services
             logger.info("Checking model assets before service startup")
+            remote_fallback = False
             if not self.asset_manager.ensure_assets():
-                logger.error("Required model assets are missing or invalid")
-                return False
+                logger.warning("Required model assets are missing or invalid; enabling remote fallback streaming")
+                remote_fallback = True
 
             self.camera_service.start()
             if not self.camera_service.wait_for_first_frame(timeout=5.0):
@@ -293,25 +294,35 @@ class RobotApplication:
                 logger.error("Camera health check failed")
                 return False
 
-            if not self.model_service.load_model():
-                model_check = self.health_service.check_ai_model(
-                    str(self.model_service.model_path),
-                    self.model_service.load_model,
-                )
-                if model_check.status != HealthCheckStatus.OK:
-                    logger.error("AI model health check failed")
-                    return False
-            else:
-                model_check = self.health_service.check_ai_model(
-                    str(self.model_service.model_path),
-                    self.model_service.load_model,
-                )
-                if model_check.status != HealthCheckStatus.OK:
-                    logger.error("AI model health check failed")
-                    return False
+            # Try to load local model unless remote fallback explicitly requested
+            if not remote_fallback:
+                if not self.model_service.load_model():
+                    logger.warning("Local model load failed; attempting remote fallback if available")
+                else:
+                    model_check = self.health_service.check_ai_model(
+                        str(self.model_service.model_path),
+                        self.model_service.load_model,
+                    )
+                    if model_check.status != HealthCheckStatus.OK:
+                        logger.warning("AI model health check failed; will attempt remote fallback")
+                    else:
+                        # Local model available and healthy
+                        self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
+                        self.lifecycle_manager.register("model", self.model_service.stop_streaming)
 
-            self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
-            self.lifecycle_manager.register("model", self.model_service.stop_streaming)
+            # If no local model was started, attempt remote streaming to server
+            if not self.model_service.is_streaming():
+                if self.network_service.is_connected():
+                    try:
+                        logger.info("Starting remote frame streaming to server (fallback mode)")
+                        self.model_service.start_remote_streaming(self.camera_service, self.network_service, throttle_fps=configs.TARGET_FPS)
+                        self.lifecycle_manager.register("model", self.model_service.stop_streaming)
+                    except Exception as exc:
+                        logger.error(f"Failed to start remote fallback streaming: {exc}")
+                        return False
+                else:
+                    logger.error("No model available and network server is not connected for fallback")
+                    return False
 
             self._register_watchdog_targets()
             self.lifecycle_manager.register("watchdog", self.watchdog_service.stop)
