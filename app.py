@@ -232,7 +232,7 @@ class RobotApplication:
             reason="Connecting to remote server",
         )
 
-        if not self.network_service.connect_to_server():
+        if not self.network_service.connect_to_server(stop_event=self._shutdown_requested):
             logger.error("Remote server connection failed")
             return False
 

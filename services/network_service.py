@@ -9,6 +9,7 @@ network library implementation.
 import json
 import logging
 import socket
+import threading
 import time
 from socket import socket as socket_obj
 from typing import Any, Dict, Optional
@@ -76,13 +77,21 @@ class NetworkService:
 
             except OSError:
                 return False
-    def connect_to_server(self) -> bool:
-        """Attempt to connect to the remote control server."""
+    def connect_to_server(self, stop_event: Optional[threading.Event] = None) -> bool:
+        """Attempt to connect to the remote control server.
+
+        The connection loop is cancellation-aware so shutdown signals can interrupt
+        long startup retries.
+        """
         logger.info(f"Connecting to control server at {self.server_url}")
-        for attempt in range(1, self.server_connection_attempts):
+        for attempt in range(1, self.server_connection_attempts + 1):
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Server connection aborted by shutdown request")
+                break
+
             try:
                 client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                client_socket.settimeout(10.0)
+                client_socket.settimeout(1.0)
                 client_socket.connect((self.server_host, self.server_port))
 
                 self.client = client_socket
@@ -94,11 +103,20 @@ class NetworkService:
                 return True
             except (OSError, socket.error) as exc:
                 logger.warning(
-                f"Attempt {attempt}/{self.server_connection_attempts} failed: {exc}"
+                    f"Attempt {attempt}/{self.server_connection_attempts} failed: {exc}"
                 )
+                try:
+                    client_socket.close()
+                except Exception:
+                    pass
+
+                if stop_event is not None and stop_event.is_set():
+                    logger.info("Server connection aborted by shutdown request")
+                    break
+
                 if attempt < self.server_connection_attempts:
-                    time.sleep(self.server_connection_attempts)
-            
+                    time.sleep(self.connection_retry_delay)
+
         self._is_connected = False
         self.client = None
         return False
