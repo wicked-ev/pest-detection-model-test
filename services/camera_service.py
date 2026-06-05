@@ -334,7 +334,7 @@ class CameraService:
                 return None
             return time.time() - self._latest_ts
 
-    def wait_for_first_frame(self, timeout: float = 5.0) -> bool:
+    def wait_for_first_frame(self, timeout: float = 25.0) -> bool:
         """Wait for first frame to be captured (up to timeout seconds)."""
         logger.debug("Waiting for first frame (timeout=%.1fs)...", timeout)
         start = time.time()
