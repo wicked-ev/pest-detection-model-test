@@ -123,24 +123,21 @@ class CameraService:
         self._latest_ts: Optional[float] = None
         self._latest_frame_id: int = 0
         self._opened = False
+        self._has_received_first_frame = False
 
     def _open_backend(self) -> bool:
-        """Select and open a camera backend with fallback strategy."""
+        """Select and open a camera backend with fallback strategy.
+        
+        Important: After opening the backend, this method immediately reads
+        the first frame and stores it, so that wait_for_first_frame() sees it
+        without waiting for the next capture loop iteration.
+        """
         logger.info("Opening camera backend (device=%d, %dx%d, fps=%d, preference=%s)",
                    self.config.device, self.config.width, self.config.height,
                    self.config.fps, self.config.backend_preference)
         
         backend_config = self.config.to_backend_config()
         logger.debug("Backend config: preference=%s", backend_config.backend_preference)
-        
-        # Check available backends
-        available = CameraBackendFactory.create_backends(backend_config)
-        logger.debug("Available backends: %s", [b.name for b in available])
-        for b in available:
-            try:
-                b.close()
-            except Exception:
-                pass
         
         backend = CameraBackendFactory.select_best_backend(
             backend_config,
@@ -158,6 +155,29 @@ class CameraService:
                 self._opened = True
             logger.info("Camera backend opened successfully: %s (device=%d, %dx%d)",
                        backend.name, backend.device, backend.width, backend.height)
+            
+            # Read first frame immediately and store it, so that
+            # wait_for_first_frame() can find it without racing the capture loop.
+            # Some backends (e.g. OpenCV) already read a test frame during open(),
+            # so we do not call read() again here for those — the capture loop
+            # will pick up the next frame.
+            # For backends that do NOT pre-read (e.g. V4L2), we do a best-effort
+            # first read here so the frame slot is populated quickly.
+            try:
+                first_frame = backend.read()
+                if first_frame is not None and isinstance(first_frame, np.ndarray) and first_frame.size > 0:
+                    with self._frame_lock:
+                        self._latest_frame = first_frame
+                        self._latest_ts = time.time()
+                        self._latest_frame_id += 1
+                        self._has_received_first_frame = True
+                    logger.info("First frame captured during backend open: shape=%s", first_frame.shape)
+            except Exception:
+                # Not all backends can read immediately after open (e.g.
+                # V4L2 may need queued buffers to drain first). The capture
+                # loop will pick up the first frame on its next iteration.
+                logger.debug("First frame not available immediately after open, capture loop will pick it up")
+            
             return True
         except Exception as e:
             logger.exception("Backend opening failed: %s", e)
@@ -231,14 +251,24 @@ class CameraService:
                 continue
             
             try:
-                # Try to read frame with timeout support
+                # Try to read frame with timeout support.
+                # IMPORTANT: Before the first frame arrives, use a much longer
+                # select timeout (matching the wait_for_first_frame deadline). 
+                # This prevents a race where the camera needs >3s to produce
+                # the first frame (auto-exposure settling, USB enumeration, etc.)
+                # and select.select() repeatedly times out, triggering an infinite
+                # reconnect loop that never produces any frame.
                 supports_fileno = True
                 try:
                     fd = backend.fileno()
-                    ready, _, _ = select.select([fd], [], [], self.config.read_timeout)
+                    select_timeout = (
+                        30.0 if not self._has_received_first_frame
+                        else self.config.read_timeout
+                    )
+                    ready, _, _ = select.select([fd], [], [], select_timeout)
                     if not ready:
                         logger.debug("Camera read timeout (%.1fs), reconnecting backend", 
-                                   self.config.read_timeout)
+                                   select_timeout)
                         with self._backend_lock:
                             if self._backend:
                                 self._backend.close()
@@ -277,6 +307,8 @@ class CameraService:
                     self._latest_ts = time.time()
                     self._latest_frame_id += 1
                     frame_count += 1
+                    if frame_count == 1:
+                        self._has_received_first_frame = True
                     
                 if frame_count == 1:
                     logger.info("First frame captured! shape=%s dtype=%s size=%d",
