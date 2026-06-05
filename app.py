@@ -684,7 +684,7 @@ class RobotApplication:
         logger.warning("Watchdog attempting camera recovery")
         self.camera_service.stop()
         self.camera_service.start()
-        return self.camera_service.wait_for_first_frame(timeout=5.0)
+        return self.camera_service.wait_for_first_frame(timeout=25.0)
 
     def _check_model_watchdog(self):
         if not self.model_service.is_streaming():
