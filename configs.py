@@ -135,7 +135,7 @@ HOTSPOT_INTERFACE = os.getenv("HOTSPOT_INTERFACE", "wlan0")
 # ============================================================================
 
 # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
 
 # Application name for log files
 APP_NAME = "robot"
