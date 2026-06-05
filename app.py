@@ -660,7 +660,7 @@ class RobotApplication:
             name="Model Inference",
             check_fn=self._check_model_watchdog,
             recovery_fn=self._restart_model_service,
-            critical=True,
+            critical=False,
         )
         self.watchdog_service.register_target(
             name="Arduino Connection",
