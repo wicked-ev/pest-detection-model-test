@@ -126,38 +126,58 @@ class CameraService:
 
     def _open_backend(self) -> bool:
         """Select and open a camera backend with fallback strategy."""
-        logger.info("Opening camera backend (device=%d, %dx%d)",
-                   self.config.device, self.config.width, self.config.height)
+        logger.info("Opening camera backend (device=%d, %dx%d, fps=%d, preference=%s)",
+                   self.config.device, self.config.width, self.config.height,
+                   self.config.fps, self.config.backend_preference)
         
         backend_config = self.config.to_backend_config()
+        logger.debug("Backend config: preference=%s", backend_config.backend_preference)
+        
+        # Check available backends
+        available = CameraBackendFactory.create_backends(backend_config)
+        logger.debug("Available backends: %s", [b.name for b in available])
+        for b in available:
+            try:
+                b.close()
+            except Exception:
+                pass
+        
         backend = CameraBackendFactory.select_best_backend(
             backend_config,
             cache_path=self._backend_cache_path,
         )
         
         if backend is None:
-            logger.error("No camera backend could be selected")
+            logger.error("No camera backend could be selected from preference: %s",
+                        backend_config.backend_preference)
             return False
         
         try:
             with self._backend_lock:
                 self._backend = backend
                 self._opened = True
-            logger.info("Camera backend opened: %s", backend.name)
+            logger.info("Camera backend opened successfully: %s (device=%d, %dx%d)",
+                       backend.name, backend.device, backend.width, backend.height)
             return True
         except Exception as e:
             logger.exception("Backend opening failed: %s", e)
             if backend:
-                backend.close()
+                try:
+                    backend.close()
+                except Exception:
+                    pass
             return False
 
     def start(self) -> None:
         """Start the camera capture thread."""
         if self._thread and self._thread.is_alive():
+            logger.debug("Camera capture thread already running")
             return
+        logger.debug("Starting camera capture thread...")
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._capture_loop, name="camera-capture", daemon=True)
         self._thread.start()
+        logger.debug("Camera capture thread started")
 
     def stop(self, timeout: float = 2.0) -> None:
         """Stop the camera capture thread."""
@@ -177,6 +197,9 @@ class CameraService:
         """Main capture loop running in background thread."""
         backoff = 0.5
         last_open_attempt = 0.0
+        frame_count = 0
+        
+        logger.debug("Camera capture loop started")
         
         while not self._stop_event.is_set():
             with self._backend_lock:
@@ -190,9 +213,10 @@ class CameraService:
                     time.sleep(0.05)
                     continue
                 
+                logger.debug("Attempting to open camera backend (attempt after %.1fs delay)", backoff)
                 last_open_attempt = now
                 if not self._open_backend():
-                    logger.warning("Camera backend open failed, retrying in %.1fs", backoff)
+                    logger.warning("Camera backend open failed, will retry in %.1fs", backoff)
                     time.sleep(backoff)
                     backoff = min(5.0, backoff * 1.5)
                     continue
@@ -200,36 +224,68 @@ class CameraService:
                 backoff = 0.5
                 with self._backend_lock:
                     backend = self._backend
+                logger.debug("Backend opened, beginning frame capture")
             
             if backend is None:
+                logger.debug("Backend is None, waiting for next attempt")
                 continue
             
             try:
                 # Try to read frame with timeout support
+                supports_fileno = True
                 try:
                     fd = backend.fileno()
                     ready, _, _ = select.select([fd], [], [], self.config.read_timeout)
                     if not ready:
-                        logger.warning("Camera read timeout, reconnecting backend")
+                        logger.debug("Camera read timeout (%.1fs), reconnecting backend", 
+                                   self.config.read_timeout)
                         with self._backend_lock:
                             if self._backend:
                                 self._backend.close()
                                 self._backend = None
                                 self._opened = False
                         continue
-                except CameraBackendError:
-                    # Backend doesn't support fileno (e.g., OpenCV)
-                    # Just try to read directly
-                    pass
+                except CameraBackendError as e:
+                    # Backend doesn't support fileno (e.g., OpenCV, Picamera2)
+                    logger.debug("Backend does not support fileno(): %s, reading directly", e)
+                    supports_fileno = False
                 
+                logger.debug("Reading frame from %s backend (supports_fileno=%s)", 
+                           backend.name, supports_fileno)
                 frame = backend.read()
+                
+                # Validate frame
+                if frame is None:
+                    logger.warning("Backend returned None frame, reconnecting")
+                    with self._backend_lock:
+                        if self._backend:
+                            self._backend.close()
+                            self._backend = None
+                            self._opened = False
+                    continue
+                
+                if not isinstance(frame, np.ndarray):
+                    logger.warning("Frame is not ndarray: %s", type(frame))
+                    continue
+                
+                if frame.size == 0:
+                    logger.warning("Frame has size 0: shape=%s", frame.shape)
+                    continue
+                
                 with self._frame_lock:
                     self._latest_frame = frame
                     self._latest_ts = time.time()
                     self._latest_frame_id += 1
+                    frame_count += 1
+                    
+                if frame_count == 1:
+                    logger.info("First frame captured! shape=%s dtype=%s size=%d",
+                              frame.shape, frame.dtype, frame.size)
+                elif frame_count % 100 == 0:
+                    logger.debug("Frame %d captured, shape=%s", frame_count, frame.shape)
                     
             except CameraBackendError as e:
-                logger.warning("Camera backend error: %s, reconnecting", e)
+                logger.warning("Camera backend error: %s, will reconnect", e)
                 with self._backend_lock:
                     if self._backend:
                         try:
@@ -280,13 +336,37 @@ class CameraService:
 
     def wait_for_first_frame(self, timeout: float = 5.0) -> bool:
         """Wait for first frame to be captured (up to timeout seconds)."""
+        logger.debug("Waiting for first frame (timeout=%.1fs)...", timeout)
         start = time.time()
+        check_count = 0
+        
         while time.time() - start < timeout:
-            if self.get_latest(copy=False) is not None:
+            check_count += 1
+            frame = self.get_latest(copy=False)
+            
+            if frame is not None:
+                elapsed = time.time() - start
+                logger.info("First frame received after %.2fs (checks=%d)", elapsed, check_count)
                 return True
+            
             if self._stop_event.is_set():
+                logger.warning("Stop event set while waiting for first frame")
                 return False
+            
+            if check_count % 40 == 0:  # Log every 2 seconds (0.05s * 40)
+                elapsed = time.time() - start
+                with self._backend_lock:
+                    backend_name = self._backend.name if self._backend else "None"
+                    opened = self._opened
+                logger.debug("Still waiting... elapsed=%.1fs backend=%s opened=%s",
+                           elapsed, backend_name, opened)
+            
             time.sleep(0.05)
+        
+        elapsed = time.time() - start
+        logger.error("Timeout waiting for first frame after %.1fs (checks=%d, backend=%s)",
+                   elapsed, check_count, 
+                   self._backend.name if self._backend else "None")
         return False
 
     def get_latest(self, copy: bool = False) -> Optional[Tuple[np.ndarray, float]]:

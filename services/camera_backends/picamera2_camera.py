@@ -53,7 +53,6 @@ class Picamera2Backend(BaseCameraBackend):
         """Check if picamera2 is installed and available."""
         try:
             import picamera2
-            # Quick availability check - the Picamera2 library should be importable
             logger.debug("Picamera2 library is available")
             return True
         except ImportError:
@@ -68,37 +67,54 @@ class Picamera2Backend(BaseCameraBackend):
         try:
             from picamera2 import Picamera2
             import libcamera
+            logger.debug("Picamera2 and libcamera libraries imported successfully")
         except ImportError as e:
+            logger.error("Failed to import Picamera2 or libcamera: %s", e)
             raise CameraBackendError(f"Picamera2 or libcamera not installed: {e}")
 
         try:
+            logger.debug("Creating Picamera2 instance for camera device %d", self.device)
             # Create camera instance
             self._camera = Picamera2(camera_num=self.device)
+            logger.debug("Picamera2 instance created")
             
             # Create camera configuration
+            logger.debug("Creating preview configuration: %dx%d RGB888 format", 
+                       self.width, self.height)
             config = self._camera.create_preview_configuration(
                 main={"format": "RGB888", "size": (self.width, self.height)},
                 raw=None,
             )
+            logger.debug("Configuration created")
             
             # Set framerate
+            logger.debug("Setting framerate to %d fps", self.fps)
             config["controls"] = {"FrameRate": self.fps}
             
             # Apply configuration
+            logger.debug("Applying camera configuration")
             self._camera.configure(config)
+            logger.debug("Configuration applied")
             
             # Start camera
+            logger.debug("Starting camera capture")
             self._camera.start()
+            logger.debug("Camera started")
             
-            logger.info("Picamera2 camera opened: device=%d %dx%d fps=%d",
+            logger.info("Picamera2 camera opened successfully: device=%d %dx%d fps=%d",
                        self.device, self.width, self.height, self.fps)
             
         except Exception as e:
+            logger.error("Picamera2 camera open failed: %s", e, exc_info=True)
             if self._camera is not None:
                 try:
                     self._camera.stop()
-                except Exception:
-                    pass
+                except Exception as cleanup_error:
+                    logger.debug("Error while stopping camera during cleanup: %s", cleanup_error)
+                try:
+                    self._camera.close()
+                except Exception as cleanup_error:
+                    logger.debug("Error while closing camera during cleanup: %s", cleanup_error)
             self._camera = None
             raise CameraBackendError(f"Picamera2 camera open failed: {e}")
 
@@ -109,22 +125,30 @@ class Picamera2Backend(BaseCameraBackend):
 
         try:
             # Capture frame
+            logger.debug("Capturing array from Picamera2")
             array = self._camera.capture_array()
+            logger.debug("Array captured, type=%s shape=%s", type(array), 
+                       getattr(array, 'shape', 'N/A'))
             
             if array is None:
-                raise CameraBackendError("Failed to capture frame from Picamera2")
+                logger.error("Picamera2 returned None array")
+                raise CameraBackendError("Failed to capture frame from Picamera2 (None returned)")
             
             # Ensure frame is in RGB format and correct shape
             if len(array.shape) != 3 or array.shape[2] != 3:
+                logger.error("Unexpected frame shape from Picamera2: %s (expected (H, W, 3))", 
+                           array.shape)
                 raise CameraBackendError(
                     f"Unexpected frame shape from Picamera2: {array.shape}"
                 )
             
+            logger.debug("Frame validated: shape=%s dtype=%s", array.shape, array.dtype)
             return array
             
         except CameraBackendError:
             raise
         except Exception as e:
+            logger.error("Failed to read frame from Picamera2: %s", e, exc_info=True)
             raise CameraBackendError(f"Failed to read frame from Picamera2: {e}")
 
     def close(self) -> None:
