@@ -687,8 +687,18 @@ class RobotApplication:
         return self.camera_service.wait_for_first_frame(timeout=60.0)
 
     def _check_model_watchdog(self):
-        if not self.model_service.is_streaming():
-            return False, "Model inference not running"
+        stream_mode = self.model_service.get_stream_mode()
+        if stream_mode is None:
+            return False, "Model streaming not running"
+
+        if stream_mode == "remote":
+            age = self.model_service.get_last_remote_activity_age()
+            if age is None:
+                return False, "No remote frame transmission yet"
+            if age > 5.0:
+                return False, f"Remote frame transmission stale ({age:.1f}s)"
+            return True, "Remote fallback streaming healthy"
+
         age = self.model_service.get_last_inference_age()
         if age is None:
             return False, "No inference output yet"
@@ -698,8 +708,23 @@ class RobotApplication:
 
     def _restart_model_service(self) -> bool:
         logger.warning("Watchdog attempting model recovery")
+        stream_mode = self.model_service.get_stream_mode()
+
+        if stream_mode == "remote":
+            if not self.network_service.is_connected():
+                logger.error("Cannot recover remote fallback streaming: network server is disconnected")
+                return False
+
+            self.model_service.stop_streaming()
+            self.model_service.start_remote_streaming(
+                self.camera_service,
+                self.network_service,
+                throttle_fps=configs.TARGET_FPS,
+            )
+            return self.model_service.is_remote_streaming()
+
         self.model_service.restart_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
-        return self.model_service.is_streaming()
+        return self.model_service.is_local_streaming()
 
     def _check_arduino_watchdog(self):
         if self.arduino is None or not self.arduino.is_connected():

@@ -105,6 +105,7 @@ class ModelService:
         self._remote_thread: Optional[threading.Thread] = None
         self._remote_stop_event = threading.Event()
         self._remote_streaming_active = False
+        self._last_remote_activity_ts: Optional[float] = None
 
     def get_backend_name(self) -> Optional[str]:
         """Get the name of the currently selected backend."""
@@ -155,10 +156,28 @@ class ModelService:
         remote_ok = self._remote_thread is not None and self._remote_thread.is_alive() and self._remote_streaming_active
         return local_ok or remote_ok
 
+    def is_remote_streaming(self) -> bool:
+        return self._remote_thread is not None and self._remote_thread.is_alive() and self._remote_streaming_active
+
+    def is_local_streaming(self) -> bool:
+        return self._inference_thread is not None and self._inference_thread.is_alive() and self._streaming_active
+
+    def get_stream_mode(self) -> Optional[str]:
+        if self.is_local_streaming():
+            return "local"
+        if self.is_remote_streaming():
+            return "remote"
+        return None
+
     def get_last_inference_age(self) -> Optional[float]:
         if self._last_inference_ts is None:
             return None
         return time.time() - self._last_inference_ts
+
+    def get_last_remote_activity_age(self) -> Optional[float]:
+        if self._last_remote_activity_ts is None:
+            return None
+        return time.time() - self._last_remote_activity_ts
 
     def restart_streaming(self, camera_service, throttle_fps: Optional[float] = None) -> None:
         self.stop_streaming()
@@ -197,7 +216,7 @@ class ModelService:
                     logger.exception("Failed to encode frame to JPEG for remote streaming")
                     return ""
 
-        def unpack_frame_result(res: Any) -> Tuple[np.ndarray, float, Optional[int]]:
+        def unpack_frame_result(res: Any) -> Tuple[Any, float, Optional[int]]:
             """Normalize camera service results into (frame, timestamp, frame_id)."""
             if isinstance(res, dict):
                 frame = res.get("frame")
@@ -368,6 +387,7 @@ class ModelService:
 
                         sent_frames += 1
                         last_sent = time.time()
+                        self._last_remote_activity_ts = last_sent
                         logger.info(
                             "Successfully sent frame_id=%s",
                             frame_id,
