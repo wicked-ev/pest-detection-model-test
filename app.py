@@ -282,7 +282,7 @@ class RobotApplication:
                 remote_fallback = True
 
             self.camera_service.start()
-            if not self.camera_service.wait_for_first_frame(timeout=25.0):
+            if not self.camera_service.wait_for_first_frame(timeout=60.0):
                 backend_name = self.camera_service._backend.name if self.camera_service._backend else "None"
                 logger.error("Camera failed to provide a first frame (backend=%s, opened=%s)",
                            backend_name, self.camera_service._opened)
@@ -684,7 +684,7 @@ class RobotApplication:
         logger.warning("Watchdog attempting camera recovery")
         self.camera_service.stop()
         self.camera_service.start()
-        return self.camera_service.wait_for_first_frame(timeout=25.0)
+        return self.camera_service.wait_for_first_frame(timeout=60.0)
 
     def _check_model_watchdog(self):
         if not self.model_service.is_streaming():
