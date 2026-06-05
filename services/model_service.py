@@ -197,15 +197,48 @@ class ModelService:
                     logger.exception("Failed to encode frame to JPEG for remote streaming")
                     return ""
 
+        def unpack_frame_result(res: Any) -> Tuple[np.ndarray, float, Optional[int]]:
+            """Normalize camera service results into (frame, timestamp, frame_id)."""
+            if isinstance(res, dict):
+                frame = res.get("frame")
+                timestamp = float(res.get("timestamp", time.time()))
+                frame_id = res.get("frame_id")
+                return frame, timestamp, frame_id
+
+            if isinstance(res, tuple):
+                if len(res) == 3:
+                    frame, timestamp, frame_id = res
+                    return frame, float(timestamp), frame_id
+                if len(res) == 2:
+                    frame, timestamp = res
+                    return frame, float(timestamp), None
+
+            if isinstance(res, np.ndarray):
+                return res, time.time(), None
+
+            raise TypeError(f"Unsupported camera result type: {type(res)!r}")
+
+        def safe_frame_shape(frame: Any) -> Any:
+            return getattr(frame, "shape", None)
+
+
         def loop() -> None:
-            logger.debug("Remote streaming loop started")
+            logger.info("Remote streaming loop started")
 
             min_frame_interval = 1.0 / throttle_fps if throttle_fps else 0.0
             last_sent = 0.0
             last_frame_id: Optional[int] = None
             frame_counter = 0
+            received_frames = 0
+            encoded_frames = 0
+            sent_frames = 0
+            skipped_duplicates = 0
+            skipped_frame_skip = 0
+            skipped_throttle = 0
+            encode_failures = 0
+            send_failures = 0
 
-            logger.debug(
+            logger.info(
                 "Streaming config: throttle_fps=%s, min_frame_interval=%.4f, frame_skip=%s",
                 throttle_fps,
                 min_frame_interval,
@@ -217,22 +250,31 @@ class ModelService:
                     res = camera_service.get_latest_metadata(copy=False)
                 except AttributeError:
                     res = camera_service.get_latest(copy=False)
+                except Exception:
+                    logger.exception("Remote streaming frame fetch failed")
+                    time.sleep(0.01)
+                    continue
 
                 if res is None:
                     logger.debug("No frame available from camera service")
                     time.sleep(0.005)
                     continue
 
-                if len(res) == 3:
-                    frame, ts, frame_id = res
-                else:
-                    frame, ts = res
-                    frame_id = None
+                try:
+                    frame, ts, frame_id = unpack_frame_result(res)
+                except Exception:
+                    logger.exception("Unexpected remote frame payload: %r", type(res))
+                    time.sleep(0.01)
+                    continue
 
-                logger.debug(
-                    "Received frame: frame_id=%s timestamp=%s",
+                received_frames += 1
+
+                logger.info(
+                    "Remote frame received: frame_id=%s timestamp=%s shape=%s received=%d",
                     frame_id,
                     ts,
+                    safe_frame_shape(frame),
+                    received_frames,
                 )
 
                 if (
@@ -240,7 +282,12 @@ class ModelService:
                     and last_frame_id is not None
                     and frame_id == last_frame_id
                 ):
-                    logger.debug("Skipping duplicate frame_id=%s", frame_id)
+                    skipped_duplicates += 1
+                    logger.debug(
+                        "Skipping duplicate frame_id=%s (duplicate_skips=%d)",
+                        frame_id,
+                        skipped_duplicates,
+                    )
                     time.sleep(0.005)
                     continue
 
@@ -248,14 +295,17 @@ class ModelService:
                 frame_counter += 1
 
                 if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
+                    skipped_frame_skip += 1
                     logger.debug(
                         "Skipping frame_id=%s due to FRAME_SKIP (counter=%s)",
                         frame_id,
                         frame_counter,
                     )
+                    time.sleep(0.001)
                     continue
 
                 if min_frame_interval and (time.time() - last_sent) < min_frame_interval:
+                    skipped_throttle += 1
                     logger.debug(
                         "Skipping frame_id=%s due to FPS throttle",
                         frame_id,
@@ -263,18 +313,27 @@ class ModelService:
                     time.sleep(0.001)
                     continue
 
-                last_sent = time.time()
-
                 try:
-                    logger.debug("Encoding frame_id=%s", frame_id)
+                    logger.info(
+                        "Encoding remote frame_id=%s (processed=%d)",
+                        frame_id,
+                        frame_counter,
+                    )
 
                     b64 = encode_frame_to_jpeg_b64(frame)
 
                     if not b64:
-                        logger.debug("Encoding returned empty payload for frame_id=%s", frame_id)
+                        encode_failures += 1
+                        logger.warning(
+                            "Encoding returned empty payload for frame_id=%s (encode_failures=%d)",
+                            frame_id,
+                            encode_failures,
+                        )
+                        time.sleep(0.005)
                         continue
 
-                    logger.debug(
+                    encoded_frames += 1
+                    logger.info(
                         "Encoded frame_id=%s (base64 size=%d bytes)",
                         frame_id,
                         len(b64),
@@ -289,32 +348,60 @@ class ModelService:
                     }
 
                     try:
-                        logger.debug(
+                        logger.info(
                             "Sending frame_id=%s timestamp=%s",
                             frame_id,
                             ts,
                         )
 
-                        network_service.send_message(payload)
+                        sent_ok = network_service.send_message(payload)
 
-                        logger.debug(
+                        if not sent_ok:
+                            send_failures += 1
+                            logger.warning(
+                                "Remote payload was not accepted by network service for frame_id=%s (send_failures=%d)",
+                                frame_id,
+                                send_failures,
+                            )
+                            time.sleep(0.005)
+                            continue
+
+                        sent_frames += 1
+                        last_sent = time.time()
+                        logger.info(
                             "Successfully sent frame_id=%s",
                             frame_id,
                         )
 
                     except Exception:
+                        send_failures += 1
                         logger.exception(
-                            "Failed to send remote frame payload (frame_id=%s)",
+                            "Failed to send remote frame payload (frame_id=%s, send_failures=%d)",
                             frame_id,
+                            send_failures,
                         )
+                        time.sleep(0.005)
 
                 except Exception:
+                    encode_failures += 1
                     logger.exception(
-                        "Remote streaming loop encountered an error (frame_id=%s)",
+                        "Remote streaming loop encountered an error during encoding/sending (frame_id=%s, encode_failures=%d)",
                         frame_id,
+                        encode_failures,
                     )
+                    time.sleep(0.005)
 
-            logger.info("Remote streaming stopped")
+            logger.info(
+                "Remote streaming stopped (received=%d encoded=%d sent=%d duplicate_skips=%d frame_skip_skips=%d throttle_skips=%d encode_failures=%d send_failures=%d)",
+                received_frames,
+                encoded_frames,
+                sent_frames,
+                skipped_duplicates,
+                skipped_frame_skip,
+                skipped_throttle,
+                encode_failures,
+                send_failures,
+            )
         self._remote_thread = threading.Thread(target=loop, name="remote-stream", daemon=True)
         self._remote_thread.start()
 
