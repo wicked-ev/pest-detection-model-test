@@ -262,7 +262,7 @@ class CameraService:
                 try:
                     fd = backend.fileno()
                     select_timeout = (
-                        30.0 if not self._has_received_first_frame
+                        60.0 if not self._has_received_first_frame
                         else self.config.read_timeout
                     )
                     ready, _, _ = select.select([fd], [], [], select_timeout)
