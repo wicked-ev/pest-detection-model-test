@@ -198,10 +198,20 @@ class ModelService:
                     return ""
 
         def loop() -> None:
+            logger.debug("Remote streaming loop started")
+
             min_frame_interval = 1.0 / throttle_fps if throttle_fps else 0.0
             last_sent = 0.0
             last_frame_id: Optional[int] = None
             frame_counter = 0
+
+            logger.debug(
+                "Streaming config: throttle_fps=%s, min_frame_interval=%.4f, frame_skip=%s",
+                throttle_fps,
+                min_frame_interval,
+                configs.FRAME_SKIP,
+            )
+
             while not self._remote_stop_event.is_set():
                 try:
                     res = camera_service.get_latest_metadata(copy=False)
@@ -209,6 +219,7 @@ class ModelService:
                     res = camera_service.get_latest(copy=False)
 
                 if res is None:
+                    logger.debug("No frame available from camera service")
                     time.sleep(0.005)
                     continue
 
@@ -218,24 +229,57 @@ class ModelService:
                     frame, ts = res
                     frame_id = None
 
-                if frame_id is not None and last_frame_id is not None and frame_id == last_frame_id:
+                logger.debug(
+                    "Received frame: frame_id=%s timestamp=%s",
+                    frame_id,
+                    ts,
+                )
+
+                if (
+                    frame_id is not None
+                    and last_frame_id is not None
+                    and frame_id == last_frame_id
+                ):
+                    logger.debug("Skipping duplicate frame_id=%s", frame_id)
                     time.sleep(0.005)
                     continue
 
                 last_frame_id = frame_id
                 frame_counter += 1
+
                 if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
+                    logger.debug(
+                        "Skipping frame_id=%s due to FRAME_SKIP (counter=%s)",
+                        frame_id,
+                        frame_counter,
+                    )
                     continue
 
                 if min_frame_interval and (time.time() - last_sent) < min_frame_interval:
+                    logger.debug(
+                        "Skipping frame_id=%s due to FPS throttle",
+                        frame_id,
+                    )
                     time.sleep(0.001)
                     continue
 
                 last_sent = time.time()
+
                 try:
+                    logger.debug("Encoding frame_id=%s", frame_id)
+
                     b64 = encode_frame_to_jpeg_b64(frame)
+
                     if not b64:
+                        logger.debug("Encoding returned empty payload for frame_id=%s", frame_id)
                         continue
+
+                    logger.debug(
+                        "Encoded frame_id=%s (base64 size=%d bytes)",
+                        frame_id,
+                        len(b64),
+                    )
+
                     payload = {
                         "type": "frame",
                         "format": "jpeg",
@@ -243,15 +287,34 @@ class ModelService:
                         "timestamp": ts,
                         "frame_id": frame_id,
                     }
+
                     try:
+                        logger.debug(
+                            "Sending frame_id=%s timestamp=%s",
+                            frame_id,
+                            ts,
+                        )
+
                         network_service.send_message(payload)
+
+                        logger.debug(
+                            "Successfully sent frame_id=%s",
+                            frame_id,
+                        )
+
                     except Exception:
-                        logger.exception("Failed to send remote frame payload")
+                        logger.exception(
+                            "Failed to send remote frame payload (frame_id=%s)",
+                            frame_id,
+                        )
+
                 except Exception:
-                    logger.exception("Remote streaming loop encountered an error")
+                    logger.exception(
+                        "Remote streaming loop encountered an error (frame_id=%s)",
+                        frame_id,
+                    )
 
             logger.info("Remote streaming stopped")
-
         self._remote_thread = threading.Thread(target=loop, name="remote-stream", daemon=True)
         self._remote_thread.start()
 
