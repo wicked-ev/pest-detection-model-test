@@ -1,9 +1,9 @@
 """Camera backend abstraction layer.
 
 This module provides a pluggable camera backend architecture supporting:
-- OpenCV (preferred when available)
+- Picamera2 (preferred for Raspberry Pi 4+, Pi 5)
+- OpenCV (cross-platform fallback)
 - V4L2 (Linux-native, minimal dependencies)
-- Remote streaming (final fallback for edge cases)
 
 Backends are tried in preference order until one loads successfully.
 Once a backend is selected, it is cached to avoid repeated failures.

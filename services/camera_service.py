@@ -74,7 +74,7 @@ class CameraConfig:
 
     def to_backend_config(self) -> CameraBackendConfig:
         """Convert to backend configuration object."""
-        preference = self.backend_preference or ("opencv", "v4l2")
+        preference = self.backend_preference or ("picamera2", "opencv", "v4l2")
         return CameraBackendConfig(
             device=self.device,
             width=self.width,
@@ -89,7 +89,8 @@ class CameraService:
     """Camera service providing a low-latency newest-frame buffer using pluggable backends.
     
     The service uses backend abstraction to support multiple camera implementations:
-    - OpenCV (preferred when available)
+    - Picamera2 (preferred for Raspberry Pi 4+, Pi 5)
+    - OpenCV (cross-platform fallback)
     - V4L2 (Linux-native)
     
     Backends are tried in preference order until one succeeds and is cached for fast

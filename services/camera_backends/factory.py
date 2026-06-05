@@ -12,6 +12,7 @@ import numpy as np
 
 from .base import BaseCameraBackend, CameraBackendError
 from .opencv_camera import OpenCVCameraBackend
+from .picamera2_camera import Picamera2Backend
 from .v4l2_camera import V4L2CameraBackend
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ class CameraBackendFactory:
     """Factory for creating and managing camera backends with fallback strategy."""
 
     BACKENDS = {
+        "picamera2": Picamera2Backend,
         "opencv": OpenCVCameraBackend,
         "v4l2": V4L2CameraBackend,
     }
@@ -69,7 +71,7 @@ class CameraBackendFactory:
         
         Skips unavailable backends and returns only those that can be instantiated.
         """
-        preference = config.backend_preference or ("opencv", "v4l2")
+        preference = config.backend_preference or ("picamera2", "opencv", "v4l2")
         backends: List[BaseCameraBackend] = []
 
         for name in preference:
@@ -150,5 +152,5 @@ class CameraBackendFactory:
                 continue
 
         logger.error("No camera backend could be selected from: %s", 
-                    config.backend_preference or ("opencv", "v4l2"))
+                    config.backend_preference or ("picamera2", "opencv", "v4l2"))
         return None
