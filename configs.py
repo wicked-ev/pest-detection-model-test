@@ -13,6 +13,7 @@ All other modules import from here.
 """
 
 import os
+import socket
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -115,6 +116,7 @@ MODEL_IOU_THRESHOLD = 0.45
 SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
 SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
 SERVER_URL = f"{SERVER_HOST}:{SERVER_PORT}"
+ROBOT_ID = os.getenv("ROBOT_ID", socket.gethostname())
 
 # Network retry logic
 NETWORK_RETRY_ATTEMPTS = 3

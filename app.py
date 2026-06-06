@@ -103,6 +103,7 @@ class RobotApplication:
         self.model_service.add_listener(self._on_detection)
         self.emergency_service = EmergencyStopService()
         self.watchdog_service = WatchdogService()
+        self.network_service.set_stream_detection_callback(self._on_detection)
 
         self.emergency_service.register_callback(self._stop_all_movement)
         self.emergency_service.register_callback(self._on_emergency_requested)
@@ -232,7 +233,11 @@ class RobotApplication:
             reason="Connecting to remote server",
         )
 
-        if not self.network_service.connect_to_server(stop_event=self._shutdown_requested):
+        if not self.network_service.connect_to_server(
+            stop_event=self._shutdown_requested,
+            robot_id=getattr(configs, "ROBOT_ID", None),
+            state_provider=lambda: self.state_machine.get_current_state().value,
+        ):
             logger.error("Remote server connection failed")
             return False
 
@@ -369,12 +374,6 @@ class RobotApplication:
             return
         self._last_housekeeping_ts = now
 
-        if self.network_service.is_connected():
-            self._send_telemetry({
-                "type": "heartbeat",
-                "state": self.state_machine.get_current_state().value,
-                "timestamp": time.time(),
-            })
         self._check_camera_watchdog()
         self._check_model_watchdog()
         self._check_arduino_watchdog()
@@ -835,4 +834,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

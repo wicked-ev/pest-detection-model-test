@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import io
-import base64
 from typing import Any
 
 import configs
@@ -106,6 +104,7 @@ class ModelService:
         self._remote_stop_event = threading.Event()
         self._remote_streaming_active = False
         self._last_remote_activity_ts: Optional[float] = None
+        self._remote_network_service: Optional[Any] = None
 
     def get_backend_name(self) -> Optional[str]:
         """Get the name of the currently selected backend."""
@@ -175,6 +174,14 @@ class ModelService:
         return time.time() - self._last_inference_ts
 
     def get_last_remote_activity_age(self) -> Optional[float]:
+        if self._remote_network_service is not None:
+            get_age = getattr(self._remote_network_service, "get_last_stream_activity_age", None)
+            if callable(get_age):
+                age = get_age()
+                if isinstance(age, (int, float)):
+                    return float(age)
+                return None
+
         if self._last_remote_activity_ts is None:
             return None
         return time.time() - self._last_remote_activity_ts
@@ -186,9 +193,9 @@ class ModelService:
     def start_remote_streaming(self, camera_service, network_service: Any, throttle_fps: Optional[float] = None) -> None:
         """Stream encoded frames to remote server for server-side inference.
 
-        Frames are JPEG-encoded and sent as base64 within JSON messages. This
-        method is intended as a fallback when local model assets or backends
-        are unavailable.
+        Frames are JPEG-encoded locally and published as binary websocket frames
+        through the network service. The websocket worker keeps only the latest
+        frame, so faster capture does not build an unbounded queue.
         """
         if self._remote_thread and self._remote_thread.is_alive():
             return
@@ -197,24 +204,38 @@ class ModelService:
         if not getattr(network_service, "is_connected", lambda: False)():
             raise RuntimeError("Network service is not connected for remote streaming")
 
+        if not getattr(network_service, "start_stream_channel", None):
+            raise RuntimeError("Network service does not support websocket streaming")
+
         self._remote_stop_event.clear()
         self._remote_streaming_active = True
+        self._remote_network_service = network_service
 
-        def encode_frame_to_jpeg_b64(frame: np.ndarray) -> str:
+        if not network_service.start_stream_channel(robot_id=getattr(configs, "ROBOT_ID", None)):
+            self._remote_streaming_active = False
+            self._remote_network_service = None
+            raise RuntimeError("Failed to establish websocket stream channel")
+
+        def encode_frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
             try:
                 from PIL import Image
                 img = Image.fromarray(frame.astype(np.uint8), mode="RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=80)
-                return base64.b64encode(buf.getvalue()).decode("ascii")
+                import io
+                stream = io.BytesIO()
+                img.save(stream, format="JPEG", quality=80)
+                return stream.getvalue()
             except Exception:
                 try:
                     import cv2
-                    _, jpeg = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-                    return base64.b64encode(jpeg.tobytes()).decode('ascii')
+                    _, jpeg = cv2.imencode(
+                        ".jpg",
+                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+                    )
+                    return jpeg.tobytes()
                 except Exception:
                     logger.exception("Failed to encode frame to JPEG for remote streaming")
-                    return ""
+                    return b""
 
         def unpack_frame_result(res: Any) -> Tuple[Any, float, Optional[int]]:
             """Normalize camera service results into (frame, timestamp, frame_id)."""
@@ -245,17 +266,15 @@ class ModelService:
             logger.info("Remote streaming loop started")
 
             min_frame_interval = 1.0 / throttle_fps if throttle_fps else 0.0
-            last_sent = 0.0
+            last_encoded_ts = 0.0
             last_frame_id: Optional[int] = None
             frame_counter = 0
             received_frames = 0
             encoded_frames = 0
-            sent_frames = 0
             skipped_duplicates = 0
             skipped_frame_skip = 0
             skipped_throttle = 0
             encode_failures = 0
-            send_failures = 0
 
             logger.info(
                 "Streaming config: throttle_fps=%s, min_frame_interval=%.4f, frame_skip=%s",
@@ -323,7 +342,7 @@ class ModelService:
                     time.sleep(0.001)
                     continue
 
-                if min_frame_interval and (time.time() - last_sent) < min_frame_interval:
+                if min_frame_interval and (time.time() - last_encoded_ts) < min_frame_interval:
                     skipped_throttle += 1
                     logger.debug(
                         "Skipping frame_id=%s due to FPS throttle",
@@ -339,9 +358,9 @@ class ModelService:
                         frame_counter,
                     )
 
-                    b64 = encode_frame_to_jpeg_b64(frame)
+                    frame_bytes = encode_frame_to_jpeg_bytes(frame)
 
-                    if not b64:
+                    if not frame_bytes:
                         encode_failures += 1
                         logger.warning(
                             "Encoding returned empty payload for frame_id=%s (encode_failures=%d)",
@@ -353,52 +372,20 @@ class ModelService:
 
                     encoded_frames += 1
                     logger.info(
-                        "Encoded frame_id=%s (base64 size=%d bytes)",
+                        "Encoded frame_id=%s (jpeg size=%d bytes)",
                         frame_id,
-                        len(b64),
+                        len(frame_bytes),
                     )
 
-                    payload = {
-                        "type": "frame",
-                        "format": "jpeg",
-                        "frame_b64": b64,
-                        "timestamp": ts,
-                        "frame_id": frame_id,
-                    }
-
                     try:
-                        logger.info(
-                            "Sending frame_id=%s timestamp=%s",
-                            frame_id,
-                            ts,
-                        )
-
-                        sent_ok = network_service.send_message(payload)
-
-                        if not sent_ok:
-                            send_failures += 1
-                            logger.warning(
-                                "Remote payload was not accepted by network service for frame_id=%s (send_failures=%d)",
-                                frame_id,
-                                send_failures,
-                            )
-                            time.sleep(0.005)
-                            continue
-
-                        sent_frames += 1
-                        last_sent = time.time()
-                        self._last_remote_activity_ts = last_sent
-                        logger.info(
-                            "Successfully sent frame_id=%s",
-                            frame_id,
-                        )
+                        network_service.update_stream_frame(frame_bytes)
+                        last_encoded_ts = time.time()
+                        logger.info("Published frame_id=%s to websocket stream buffer", frame_id)
 
                     except Exception:
-                        send_failures += 1
                         logger.exception(
-                            "Failed to send remote frame payload (frame_id=%s, send_failures=%d)",
+                            "Failed to publish remote frame payload (frame_id=%s)",
                             frame_id,
-                            send_failures,
                         )
                         time.sleep(0.005)
 
@@ -412,15 +399,13 @@ class ModelService:
                     time.sleep(0.005)
 
             logger.info(
-                "Remote streaming stopped (received=%d encoded=%d sent=%d duplicate_skips=%d frame_skip_skips=%d throttle_skips=%d encode_failures=%d send_failures=%d)",
+                "Remote streaming stopped (received=%d encoded=%d duplicate_skips=%d frame_skip_skips=%d throttle_skips=%d encode_failures=%d)",
                 received_frames,
                 encoded_frames,
-                sent_frames,
                 skipped_duplicates,
                 skipped_frame_skip,
                 skipped_throttle,
                 encode_failures,
-                send_failures,
             )
         self._remote_thread = threading.Thread(target=loop, name="remote-stream", daemon=True)
         self._remote_thread.start()
@@ -562,8 +547,14 @@ class ModelService:
             self._remote_stop_event.set()
             if self._remote_thread:
                 self._remote_thread.join(timeout)
+            if self._remote_network_service is not None:
+                try:
+                    self._remote_network_service.stop_stream_channel(timeout=timeout)
+                except Exception:
+                    logger.exception("Failed to stop websocket stream channel")
         finally:
             self._remote_streaming_active = False
+            self._remote_network_service = None
 
 
 if __name__ == "__main__":
