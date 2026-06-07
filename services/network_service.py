@@ -135,7 +135,7 @@ class NetworkService:
 
         return None
 
-    def wait_for_client(self, host: Optional[str] = None, port: Optional[int] = None) -> bool:
+    def wait_for_client(self, host: Optional[str] = None, port: Optional[int] = None, stop_event: Optional[threading.Event] = None) -> bool:
         logger.info("Waiting for a client connection on the local socket server")
 
         host = host or self.server_host
@@ -146,13 +146,33 @@ class NetworkService:
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._server_socket.bind((host, port))
             self._server_socket.listen(1)
+            # Set short timeout so we can poll for shutdown
+            self._server_socket.settimeout(1.0)
 
-            client, addr = self._server_socket.accept()
-            logger.info("Client connected with address %s", addr)
-            self.client = client
-            self._is_connected = True
-            self._is_server_on = True
-            return True
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    logger.info("wait_for_client cancelled by stop event")
+                    try:
+                        self._server_socket.close()
+                    except Exception:
+                        pass
+                    self._is_connected = False
+                    return False
+
+                try:
+                    client, addr = self._server_socket.accept()
+                    logger.info("Client connected with address %s", addr)
+                    self.client = client
+                    self._is_connected = True
+                    self._is_server_on = True
+                    # remove timeout on accepted socket
+                    try:
+                        self.client.settimeout(None)
+                    except Exception:
+                        pass
+                    return True
+                except socket.timeout:
+                    continue
         except OSError as exc:
             logger.error("Error accepting client connection on local server %s:%s: %s", host, port, exc)
             self._is_connected = False

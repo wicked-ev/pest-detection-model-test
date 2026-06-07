@@ -238,7 +238,7 @@ class RobotApplication:
             return True
 
         logger.info("No saved WiFi network available, entering provisioning mode")
-        if not self.hotspot_service.enter_provisioning_mode():
+        if not self.hotspot_service.enter_provisioning_mode(stop_event=self._shutdown_requested):
             logger.error("WiFi provisioning failed")
             return False
 
@@ -311,7 +311,7 @@ class RobotApplication:
             # Ensure model assets are present and valid before starting services
             logger.info("Checking model assets before service startup")
             remote_fallback = False
-            if not self.asset_manager.ensure_assets():
+            if not self.asset_manager.ensure_assets(stop_event=self._shutdown_requested):
                 logger.warning("Required model assets are missing or invalid; enabling remote fallback streaming")
                 remote_fallback = True
 

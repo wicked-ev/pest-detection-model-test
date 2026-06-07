@@ -221,7 +221,7 @@ class HotspotProvisioningService:
     def __init__(self, wifi_manager: Optional[WiFiManager] = None):
         self.wifi_manager = wifi_manager or WiFiManager()
 
-    def enter_provisioning_mode(self) -> bool:
+    def enter_provisioning_mode(self, stop_event: Optional[threading.Event] = None) -> bool:
         """Prepare the robot so a user can connect and provide WiFi credentials.
         
         This method:
@@ -243,8 +243,8 @@ class HotspotProvisioningService:
         
         # Step 2: Set up network service and accept provisioning clients.
         network_service = NetworkService()
-        if not network_service.wait_for_client():
-            logger.error("Failed to accept provisioning client connection")
+        if not network_service.wait_for_client(stop_event=stop_event):
+            logger.error("Failed to accept provisioning client connection or cancelled")
             return False
 
         logger.info("Provisioning client connected; entering message loop")
@@ -252,6 +252,9 @@ class HotspotProvisioningService:
         try:
             # Keep the provisioning session open so the user can retry.
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    logger.info("Provisioning cancelled by stop event")
+                    return False
                 # Receive a message (allow extra time for uploads)
                 message = network_service.receive_message_with_timeout(timeout=30.0)
 
@@ -259,7 +262,10 @@ class HotspotProvisioningService:
                     logger.info("No message received from client; waiting for reconnection or next message")
                     # Try to accept a new client if the previous closed connection
                     network_service.disconnect()
-                    if not network_service.wait_for_client():
+                    if stop_event is not None and stop_event.is_set():
+                        logger.info("Provisioning cancelled while waiting for reconnection")
+                        return False
+                    if not network_service.wait_for_client(stop_event=stop_event):
                         logger.info("No client reconnected; continuing to wait")
                         time.sleep(1)
                         continue

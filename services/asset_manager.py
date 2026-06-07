@@ -94,13 +94,13 @@ class AssetManager:
             return self._validate_onnx(path)
         return True
 
-    def ensure_assets(self) -> bool:
+    def ensure_assets(self, stop_event: Optional["threading.Event"] = None) -> bool:
         """Ensure required model and annotation files exist and are valid."""
         primary_kind = "tflite" if self.model_path.suffix.lower() == ".tflite" else "onnx"
         if not self._is_valid_file(self.model_path, primary_kind):
             logger.info("Primary model missing or invalid, downloading from %s", self.model_url)
             try:
-                self.download_service.download(self.model_url, self.model_path)
+                self.download_service.download(self.model_url, self.model_path, stop_event=stop_event)
             except DownloadError as exc:
                 logger.error("Model download failed: %s", exc)
                 return False
@@ -112,6 +112,10 @@ class AssetManager:
                     logger.exception("Failed to remove invalid model file")
                 return False
 
+        if stop_event is not None and stop_event.is_set():
+            logger.info("Asset ensure cancelled by stop event")
+            return False
+
         if self.onnx_model_path != self.model_path and self.onnx_model_path.exists():
             if not self._is_valid_file(self.onnx_model_path, "onnx"):
                 logger.warning("Optional ONNX fallback model exists but is invalid: %s", self.onnx_model_path)
@@ -119,7 +123,7 @@ class AssetManager:
         if not self._is_valid_file(self.annotations_path, "annotations"):
             logger.info("Annotations missing or invalid, downloading from %s", self.annotations_url)
             try:
-                self.download_service.download(self.annotations_url, self.annotations_path)
+                self.download_service.download(self.annotations_url, self.annotations_path, stop_event=stop_event)
             except DownloadError as exc:
                 logger.error("Annotations download failed: %s", exc)
                 return False

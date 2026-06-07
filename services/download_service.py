@@ -56,7 +56,7 @@ class DownloadService:
         # Use carriage return to overwrite line; ensure flush
         print(line + "\r", end="", flush=True)
 
-    def download(self, url: str, dest_path: Path) -> None:
+    def download(self, url: str, dest_path: Path, stop_event: Optional["threading.Event"] = None) -> None:
         dest_path = Path(dest_path)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = dest_path.with_suffix(dest_path.suffix + ".part")
@@ -90,6 +90,9 @@ class DownloadService:
                     with open(temp_path, mode) as fh:
                         last_update = 0.0
                         for chunk in r.iter_content(chunk_size=self.chunk_size):
+                            if stop_event is not None and stop_event.is_set():
+                                logger.info("Download cancelled by stop event: %s", url)
+                                raise DownloadError("Download cancelled")
                             if chunk:
                                 fh.write(chunk)
                                 downloaded += len(chunk)
