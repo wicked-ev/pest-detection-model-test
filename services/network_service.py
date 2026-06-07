@@ -191,8 +191,21 @@ class NetworkService:
         self._control_thread.start()
 
         wait_timeout = max(5.0, float(self.server_connection_attempts) * float(self.connection_retry_delay))
-        if self._control_connected_event.wait(timeout=wait_timeout):
-            return True
+        deadline = time.time() + wait_timeout
+        while time.time() < deadline:
+            if self._control_connected_event.wait(timeout=min(0.1, max(0.0, deadline - time.time()))):
+                return True
+
+            if stop_event is not None and stop_event.is_set():
+                logger.info("Control websocket connection cancelled during startup")
+                self._control_stop_event.set()
+                if self._control_thread:
+                    self._control_thread.join(timeout=2.0)
+                self._control_thread = None
+                self._control_connected = False
+                self._is_connected = self.client is not None
+                self._control_shutdown_event = None
+                return False
 
         logger.error("Timed out while establishing control websocket connection")
         self._control_stop_event.set()

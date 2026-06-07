@@ -148,9 +148,17 @@ class RobotApplication:
 
             logger.info("\n[1/4] PHASE: BOOTING")
             logger.info("-" * 70)
-            time.sleep(0.5)
+            if self._shutdown_requested.wait(timeout=0.5):
+                logger.info("Shutdown requested during startup boot phase")
+                self._rollback_startup()
+                return False
 
             if not self._startup_network():
+                self._rollback_startup()
+                return False
+
+            if self._shutdown_requested.is_set():
+                logger.info("Shutdown requested during startup after network initialization")
                 self._rollback_startup()
                 return False
 
@@ -162,11 +170,26 @@ class RobotApplication:
                 self._rollback_startup()
                 return False
 
+            if self._shutdown_requested.is_set():
+                logger.info("Shutdown requested during startup after server connection")
+                self._rollback_startup()
+                return False
+
             if not self._startup_hardware():
                 self._rollback_startup()
                 return False
 
+            if self._shutdown_requested.is_set():
+                logger.info("Shutdown requested during startup after hardware initialization")
+                self._rollback_startup()
+                return False
+
             if not self._startup_services():
+                self._rollback_startup()
+                return False
+
+            if self._shutdown_requested.is_set():
+                logger.info("Shutdown requested during startup after service initialization")
                 self._rollback_startup()
                 return False
 
@@ -271,6 +294,12 @@ class RobotApplication:
         if self.motors:
             self.motors.stop()
 
+    def _startup_cancelled(self, stage: str) -> bool:
+        if self._shutdown_requested.is_set():
+            logger.info("Shutdown requested during %s; aborting startup", stage)
+            return True
+        return False
+
     def _startup_services(self) -> bool:
         """Start camera, model, and watchdog services."""
         self.state_machine.transition_to(
@@ -286,13 +315,19 @@ class RobotApplication:
                 logger.warning("Required model assets are missing or invalid; enabling remote fallback streaming")
                 remote_fallback = True
 
+            if self._startup_cancelled("asset validation"):
+                return False
+
             self.camera_service.start()
-            if not self.camera_service.wait_for_first_frame(timeout=60.0):
+            if not self.camera_service.wait_for_first_frame(timeout=60.0, stop_event=self._shutdown_requested):
                 backend_name = self.camera_service._backend.name if self.camera_service._backend else "None"
                 logger.error("Camera failed to provide a first frame (backend=%s, opened=%s)",
                            backend_name, self.camera_service._opened)
                 return False
             self.lifecycle_manager.register("camera", self.camera_service.stop)
+
+            if self._startup_cancelled("camera startup"):
+                return False
 
             camera_check = self.health_service.check_camera(
                 lambda: self.camera_service.get_latest(copy=False) is not None
@@ -301,11 +336,16 @@ class RobotApplication:
                 logger.error("Camera health check failed")
                 return False
 
+            if self._startup_cancelled("camera health check"):
+                return False
+
             # Try to load local model unless remote fallback explicitly requested
             if not remote_fallback:
                 if not self.model_service.load_model():
                     logger.warning("Local model load failed; attempting remote fallback if available")
                 else:
+                    if self._startup_cancelled("model loading"):
+                        return False
                     model_check = self.health_service.check_ai_model(
                         str(self.model_service.model_path),
                         self.model_service.load_model,
@@ -316,6 +356,9 @@ class RobotApplication:
                         # Local model available and healthy
                         self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
                         self.lifecycle_manager.register("model", self.model_service.stop_streaming)
+
+            if self._startup_cancelled("model startup"):
+                return False
 
             # If no local model was started, attempt remote streaming to server
             if not self.model_service.is_streaming():
@@ -330,6 +373,9 @@ class RobotApplication:
                 else:
                     logger.error("No model available and network server is not connected for fallback")
                     return False
+
+            if self._startup_cancelled("stream startup"):
+                return False
 
             self._register_watchdog_targets()
             self.lifecycle_manager.register("watchdog", self.watchdog_service.stop)
