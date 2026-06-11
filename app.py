@@ -118,6 +118,8 @@ class RobotApplication:
         self._provisioning_active = False
         self._is_running = False
         self._last_housekeeping_ts = 0.0
+        self._streaming_enabled = True
+        self._stream_commands_togglable = True
         
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
@@ -265,6 +267,7 @@ class RobotApplication:
             return False
 
         logger.info("Connected to remote control server")
+        self.lifecycle_manager.register("network", self.network_service.disconnect)
         return True
 
     def _startup_hardware(self) -> bool:
@@ -598,10 +601,17 @@ class RobotApplication:
             logger.warning("Remote command payload must be a JSON object")
             return
 
-        command = str(payload.get("command", "")).strip().lower()
-        if not command:
+        raw_command = str(payload.get("command", "")).strip().lower()
+        if not raw_command:
             logger.warning("Remote command missing 'command' field")
             return
+
+        command = raw_command.replace("-", "_").replace(" ", "_")
+        toggle_val = payload.get("toggle", False)
+        if isinstance(toggle_val, str):
+            toggle_stream = toggle_val.strip().lower() in {"true", "1", "yes", "on", "toggle"}
+        else:
+            toggle_stream = bool(toggle_val)
 
         if command == "move":
             direction = str(payload.get("direction", "stop")).strip().lower()
@@ -618,8 +628,29 @@ class RobotApplication:
             self._execute_movement(direction_map[direction])
             return
 
-        if command in {"stop", "halt", "pause"}:
+        if command in {"halt", "pause"}:
             self._execute_movement(MovementDirection.STOP)
+            return
+
+        if command in {"start_stream", "startstream", "stream_start"}:
+            self._handle_stream_command(start_requested=True, toggle=toggle_stream)
+            return
+
+        if command in {"stop_stream", "stopstream", "stream_stop"}:
+            self._handle_stream_command(start_requested=False, toggle=toggle_stream)
+            return
+
+        if command in {"toggle_stream", "stream_toggle", "toggle", "togglestream"}:
+            self._handle_stream_command(start_requested=not self.model_service.is_streaming(), toggle=True)
+            return
+
+        if command in {"stop", "shutdown", "poweroff"}:
+            logger.warning("Remote shutdown command received")
+            self.shutdown()
+            return
+
+        if command in {"reboot", "restart"}:
+            self._perform_remote_reboot()
             return
 
         if command == "status":
@@ -633,7 +664,88 @@ class RobotApplication:
             self._enqueue_event("diagnostics", None)
             return
 
-        logger.warning(f"Unknown remote command: {command}")
+        logger.warning(f"Unknown remote command: {raw_command}")
+
+    def _handle_stream_command(self, start_requested: bool, toggle: bool = False) -> None:
+        """Handle remote stream control with optional toggle behavior for debugging."""
+        should_start = start_requested
+        is_streaming = self.model_service.is_streaming()
+
+        if toggle or (self._stream_commands_togglable and (
+            (start_requested and is_streaming) or (not start_requested and not is_streaming)
+        )):
+            should_start = not is_streaming
+            logger.info(f"Toggling stream state: requested={start_requested}, is_streaming={is_streaming} -> new_state={should_start}")
+
+        if should_start:
+            self._streaming_enabled = True
+            if is_streaming:
+                logger.info("Stream already active")
+                return
+            if self._start_model_streaming():
+                logger.info("Stream started via remote command")
+            else:
+                logger.error("Failed to start stream via remote command")
+            return
+
+        self._streaming_enabled = False
+        if not is_streaming:
+            logger.info("Stream already stopped")
+            return
+
+        self.model_service.stop_streaming()
+        if self.state_machine.is_in_state(RobotState.DETECTING):
+            self.state_machine.transition_to(
+                RobotState.READY,
+                reason="Streaming stopped by remote command",
+            )
+        logger.info("Stream stopped via remote command")
+
+    def _start_model_streaming(self) -> bool:
+        """Start local inference streaming, falling back to remote streaming when needed."""
+        if self.model_service.is_streaming():
+            return True
+
+        if not self.camera_service.is_running():
+            logger.warning("Camera service is not running; starting camera before stream activation")
+            self.camera_service.start()
+            if not self.camera_service.wait_for_first_frame(timeout=60.0, stop_event=self._shutdown_requested):
+                logger.error("Camera failed to provide a frame after remote stream start request")
+                return False
+
+        try:
+            self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
+            return self.model_service.is_local_streaming()
+        except Exception as exc:
+            logger.warning(f"Local stream start failed, trying remote fallback: {exc}")
+
+        if not self.network_service.is_connected():
+            logger.error("Cannot start remote fallback streaming: network server is disconnected")
+            return False
+
+        try:
+            self.model_service.start_remote_streaming(
+                self.camera_service,
+                self.network_service,
+                throttle_fps=configs.TARGET_FPS,
+            )
+            return self.model_service.is_remote_streaming()
+        except Exception as exc:
+            logger.error(f"Remote fallback stream start failed: {exc}")
+            return False
+
+    def _perform_remote_reboot(self) -> None:
+        """Shutdown services and re-exec the current Python process."""
+        logger.warning("Remote reboot command received")
+        self.shutdown()
+
+        python_executable = sys.executable
+        argv = [python_executable, *sys.argv]
+        logger.warning(f"Rebooting process: {' '.join(argv)}")
+        try:
+            os.execv(python_executable, argv)
+        except Exception as exc:
+            logger.error(f"Process reboot failed: {exc}")
 
     def _execute_movement(self, direction: MovementDirection) -> None:
         if self.motors is None:
@@ -674,6 +786,9 @@ class RobotApplication:
         payload = {
             "state": self.state_machine.get_current_state().value,
             "emergency": self.emergency_service.is_engaged(),
+            "stream_enabled": self._streaming_enabled,
+            "streaming": self.model_service.is_streaming(),
+            "stream_mode": self.model_service.get_stream_mode(),
         }
         if self.motors:
             status = self.motors.get_status()
@@ -716,6 +831,8 @@ class RobotApplication:
         self.watchdog_service.start()
 
     def _check_camera_watchdog(self):
+        if self._shutdown_requested.is_set() or self._shutdown_started:
+            return True, "Shutdown in progress"
         if not self.camera_service.is_running():
             return False, "Camera capture thread inactive"
         age = self.camera_service.get_last_frame_age()
@@ -732,6 +849,11 @@ class RobotApplication:
         return self.camera_service.wait_for_first_frame(timeout=60.0)
 
     def _check_model_watchdog(self):
+        if self._shutdown_requested.is_set() or self._shutdown_started:
+            return True, "Shutdown in progress"
+        if not self._streaming_enabled:
+            return True, "Model streaming intentionally paused"
+
         stream_mode = self.model_service.get_stream_mode()
         if stream_mode is None:
             return False, "Model streaming not running"
@@ -752,6 +874,10 @@ class RobotApplication:
         return True, "Model inference healthy"
 
     def _restart_model_service(self) -> bool:
+        if not self._streaming_enabled:
+            logger.info("Skipping model watchdog recovery because streaming is intentionally paused")
+            return True
+
         logger.warning("Watchdog attempting model recovery")
         stream_mode = self.model_service.get_stream_mode()
 
@@ -768,10 +894,11 @@ class RobotApplication:
             )
             return self.model_service.is_remote_streaming()
 
-        self.model_service.restart_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
-        return self.model_service.is_local_streaming()
+        return self._start_model_streaming()
 
     def _check_arduino_watchdog(self):
+        if self._shutdown_requested.is_set() or self._shutdown_started:
+            return True, "Shutdown in progress"
         if self.arduino is None or not self.arduino.is_connected():
             return False, "Arduino disconnected"
         if self.arduino.last_response_age() > max(3.0, configs.ARDUINO_TIMEOUT * 2):
@@ -792,6 +919,9 @@ class RobotApplication:
         self.shutdown()
 
     def _on_watchdog_failure(self, target_name: str, message: str) -> None:
+        if self._shutdown_requested.is_set() or self._shutdown_started:
+            logger.debug(f"Ignoring watchdog failure for {target_name} during shutdown/reboot: {message}")
+            return
         logger.critical(f"Watchdog failure for {target_name}: {message}")
         self.emergency_service.engage(
             f"Watchdog failure ({target_name}): {message}"

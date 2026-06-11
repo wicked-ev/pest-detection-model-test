@@ -48,8 +48,8 @@ SAMPLES_DIR.mkdir(exist_ok=True)
 # Windows: "COM3", "COM4" (varies by device)
 ARDUINO_PORT = os.getenv("ARDUINO_PORT", "/dev/ttyUSB0")
 
-# Serial communication speed (must match Arduino sketch)
-ARDUINO_BAUDRATE = int(os.getenv("ARDUINO_BAUDRATE", 9600))
+_baud_env = os.getenv("ARDUINO_BAUDRATE", "9600")
+ARDUINO_BAUDRATE = int(_baud_env) if _baud_env.strip() else 9600
 
 # Serial read/write timeouts (seconds)
 ARDUINO_TIMEOUT = 2.0
@@ -112,9 +112,10 @@ MODEL_IOU_THRESHOLD = 0.45
 # NETWORK CONFIGURATION
 # ============================================================================
 
-# WebSocket server for remote control
-SERVER_HOST = os.getenv("SERVER_HOST", "localhost")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
+_host_env = os.getenv("SERVER_HOST", "localhost")
+SERVER_HOST = _host_env if _host_env.strip() else "localhost"
+_port_env = os.getenv("SERVER_PORT", "8000")
+SERVER_PORT = int(_port_env) if _port_env.strip() else 8000
 SERVER_URL = f"{SERVER_HOST}:{SERVER_PORT}"
 ROBOT_ID = os.getenv("ROBOT_ID", socket.gethostname())
 

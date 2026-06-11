@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import logging
 import mmap
 import os
@@ -70,6 +73,8 @@ VIDIOC_STREAMOFF = _IOW('V', 19, 4)
 
 def _ioctl(fd, request, buf):
     """Wrapper around fcntl.ioctl that raises OSError on failure."""
+    if fcntl is None:
+        raise OSError("fcntl module is not available on this platform")
     return fcntl.ioctl(fd, request, buf, True)
 
 
@@ -166,6 +171,8 @@ class V4L2CameraBackend(BaseCameraBackend):
 
     def is_available(self) -> bool:
         """Check if device exists and is readable."""
+        if fcntl is None:
+            return False
         try:
             stat_result = os.stat(self.device_path)
             # Check if it's a character device
