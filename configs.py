@@ -181,6 +181,9 @@ MAX_RECOVERY_ATTEMPTS = 3
 # Delay before attempting recovery (seconds)
 RECOVERY_DELAY = 2.0
 
+# Verbose streaming logs toggle
+STREAMING_LOGS_ENABLED = os.getenv("STREAMING_LOGS_ENABLED", "False").lower() in {"true", "1", "yes", "on"}
+
 
 def get_config_summary() -> str:
     """Return a summary of current configuration."""

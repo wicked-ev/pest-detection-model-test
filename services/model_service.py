@@ -307,13 +307,14 @@ class ModelService:
 
                 received_frames += 1
 
-                logger.info(
-                    "Remote frame received: frame_id=%s timestamp=%s shape=%s received=%d",
-                    frame_id,
-                    ts,
-                    safe_frame_shape(frame),
-                    received_frames,
-                )
+                if configs.STREAMING_LOGS_ENABLED:
+                    logger.debug(
+                        "Remote frame received: frame_id=%s timestamp=%s shape=%s received=%d",
+                        frame_id,
+                        ts,
+                        safe_frame_shape(frame),
+                        received_frames,
+                    )
 
                 if (
                     frame_id is not None
@@ -321,11 +322,12 @@ class ModelService:
                     and frame_id == last_frame_id
                 ):
                     skipped_duplicates += 1
-                    logger.debug(
-                        "Skipping duplicate frame_id=%s (duplicate_skips=%d)",
-                        frame_id,
-                        skipped_duplicates,
-                    )
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug(
+                            "Skipping duplicate frame_id=%s (duplicate_skips=%d)",
+                            frame_id,
+                            skipped_duplicates,
+                        )
                     time.sleep(0.005)
                     continue
 
@@ -334,29 +336,32 @@ class ModelService:
 
                 if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
                     skipped_frame_skip += 1
-                    logger.debug(
-                        "Skipping frame_id=%s due to FRAME_SKIP (counter=%s)",
-                        frame_id,
-                        frame_counter,
-                    )
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug(
+                            "Skipping frame_id=%s due to FRAME_SKIP (counter=%s)",
+                            frame_id,
+                            frame_counter,
+                        )
                     time.sleep(0.001)
                     continue
 
                 if min_frame_interval and (time.time() - last_encoded_ts) < min_frame_interval:
                     skipped_throttle += 1
-                    logger.debug(
-                        "Skipping frame_id=%s due to FPS throttle",
-                        frame_id,
-                    )
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug(
+                            "Skipping frame_id=%s due to FPS throttle",
+                            frame_id,
+                        )
                     time.sleep(0.001)
                     continue
 
                 try:
-                    logger.info(
-                        "Encoding remote frame_id=%s (processed=%d)",
-                        frame_id,
-                        frame_counter,
-                    )
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug(
+                            "Encoding remote frame_id=%s (processed=%d)",
+                            frame_id,
+                            frame_counter,
+                        )
 
                     frame_bytes = encode_frame_to_jpeg_bytes(frame)
 
@@ -371,16 +376,18 @@ class ModelService:
                         continue
 
                     encoded_frames += 1
-                    logger.info(
-                        "Encoded frame_id=%s (jpeg size=%d bytes)",
-                        frame_id,
-                        len(frame_bytes),
-                    )
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug(
+                            "Encoded frame_id=%s (jpeg size=%d bytes)",
+                            frame_id,
+                            len(frame_bytes),
+                        )
 
                     try:
                         network_service.update_stream_frame(frame_bytes)
                         last_encoded_ts = time.time()
-                        logger.info("Published frame_id=%s to websocket stream buffer", frame_id)
+                        if configs.STREAMING_LOGS_ENABLED:
+                            logger.debug("Published frame_id=%s to websocket stream buffer", frame_id)
 
                     except Exception:
                         logger.exception(
