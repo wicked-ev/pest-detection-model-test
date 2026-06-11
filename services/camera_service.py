@@ -277,11 +277,13 @@ class CameraService:
                         continue
                 except CameraBackendError as e:
                     # Backend doesn't support fileno (e.g., OpenCV, Picamera2)
-                    logger.debug("Backend does not support fileno(): %s, reading directly", e)
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug("Backend does not support fileno(): %s, reading directly", e)
                     supports_fileno = False
                 
-                logger.debug("Reading frame from %s backend (supports_fileno=%s)", 
-                           backend.name, supports_fileno)
+                if configs.STREAMING_LOGS_ENABLED:
+                    logger.debug("Reading frame from %s backend (supports_fileno=%s)", 
+                               backend.name, supports_fileno)
                 frame = backend.read()
                 
                 # Validate frame
@@ -314,7 +316,8 @@ class CameraService:
                     logger.info("First frame captured! shape=%s dtype=%s size=%d",
                               frame.shape, frame.dtype, frame.size)
                 elif frame_count % 100 == 0:
-                    logger.debug("Frame %d captured, shape=%s", frame_count, frame.shape)
+                    if configs.STREAMING_LOGS_ENABLED:
+                        logger.debug("Frame %d captured, shape=%s", frame_count, frame.shape)
                     
             except CameraBackendError as e:
                 logger.warning("Camera backend error: %s, will reconnect", e)

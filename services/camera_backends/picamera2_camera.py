@@ -17,6 +17,7 @@ Disadvantages:
 from __future__ import annotations
 
 import logging
+import configs
 from typing import Optional
 
 import numpy as np
@@ -125,10 +126,12 @@ class Picamera2Backend(BaseCameraBackend):
 
         try:
             # Capture frame
-            logger.debug("Capturing array from Picamera2")
+            if configs.STREAMING_LOGS_ENABLED:
+                logger.debug("Capturing array from Picamera2")
             array = self._camera.capture_array()
-            logger.debug("Array captured, type=%s shape=%s", type(array), 
-                       getattr(array, 'shape', 'N/A'))
+            if configs.STREAMING_LOGS_ENABLED:
+                logger.debug("Array captured, type=%s shape=%s", type(array), 
+                           getattr(array, 'shape', 'N/A'))
             
             if array is None:
                 logger.error("Picamera2 returned None array")
@@ -142,7 +145,8 @@ class Picamera2Backend(BaseCameraBackend):
                     f"Unexpected frame shape from Picamera2: {array.shape}"
                 )
             
-            logger.debug("Frame validated: shape=%s dtype=%s", array.shape, array.dtype)
+            if configs.STREAMING_LOGS_ENABLED:
+                logger.debug("Frame validated: shape=%s dtype=%s", array.shape, array.dtype)
             return array
             
         except CameraBackendError:
