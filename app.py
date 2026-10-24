@@ -62,6 +62,8 @@ from services.network_service import NetworkService
 from services.camera_service import CameraService
 from services.model_service import ModelService
 from services.asset_manager import AssetManager
+from services.drive_service import DriveController
+from services.spray_service import SprayController
 
 
 class RobotApplication:
@@ -110,6 +112,11 @@ class RobotApplication:
         self.watchdog_service.register_failure_callback(self._on_watchdog_failure)
         # Asset manager: ensure model assets before starting model service
         self.asset_manager = AssetManager()
+
+        # Manual driving (with automatic stop) and the sprayer. They read self.motors
+        # when used, so they simply report "no motors" until the Arduino is connected.
+        self.drive = DriveController(lambda: self.motors)
+        self.spray = SprayController(lambda: self.motors, self.drive, on_spray=self._on_spray)
         
         # Lifecycle
         self._event_queue: Queue[Tuple[str, Optional[object]]] = Queue()
@@ -118,6 +125,8 @@ class RobotApplication:
         self._provisioning_active = False
         self._is_running = False
         self._last_housekeeping_ts = 0.0
+        # Detections arrive several times a second; log only changes (and a periodic reminder).
+        self._last_detection_log: Tuple[tuple, float] = ((), 0.0)
         self._streaming_enabled = True
         # Debug option: when True, "start_stream" on a running stream stops it (and vice versa).
         # Off, because the dashboard sends start/stop and expects exactly that.
@@ -268,6 +277,7 @@ class RobotApplication:
             stop_event=self._shutdown_requested,
             robot_id=getattr(configs, "ROBOT_ID", None),
             state_provider=lambda: self.state_machine.get_current_state().value,
+            status_provider=self._live_status,
         )
         if connected:
             logger.info("Connected to remote control server")
@@ -298,6 +308,8 @@ class RobotApplication:
             return True
         self.motors = motors
         self.lifecycle_manager.register("motors", self._cleanup_motors)
+        self.lifecycle_manager.register("spray", self.spray.cancel)
+        self.lifecycle_manager.register("drive", self.drive.close)
         return True
 
     def _cleanup_motors(self) -> None:
@@ -414,8 +426,16 @@ class RobotApplication:
             # The server already has these results: it computed them (server mode) or
             # receives them on the stream (monitor mode), so nothing is sent back here.
             detections = payload if isinstance(payload, list) else []
-            labels = sorted({str(d.get("class")) for d in detections if isinstance(d, dict)})
-            logger.info("Detected %d object(s): %s", len(detections), ", ".join(labels))
+            labels = tuple(sorted({str(d.get("class")) for d in detections if isinstance(d, dict)}))
+            last_labels, last_time = self._last_detection_log
+            now = time.monotonic()
+            if labels != last_labels or now - last_time > 30.0:
+                logger.info("Detected %d object(s): %s", len(detections), ", ".join(labels))
+                self._last_detection_log = (labels, now)
+            else:
+                logger.debug("Detected %d object(s): %s", len(detections), ", ".join(labels))
+            if self.spray.on_detections(detections):
+                self._send_live_status()
             return
         elif event_type == "diagnostics":
             self.print_diagnostics()
@@ -459,7 +479,8 @@ class RobotApplication:
                 self._process_network_messages()
 
                 try:
-                    event_type, payload = self._event_queue.get(timeout=0.5)
+                    # Short wait: drive commands must be handled well within DRIVE_COMMAND_TIMEOUT.
+                    event_type, payload = self._event_queue.get(timeout=0.05)
                     self._handle_event(event_type, payload)
                 except Empty:
                     self._perform_periodic_housekeeping()
@@ -581,22 +602,41 @@ class RobotApplication:
         if not self.network_service.is_connected():
             return
 
-        try:
-            message = self.network_service.receive_message_with_timeout(timeout=0.1)
-        except Exception as exc:
-            logger.debug(f"Error reading remote command: {exc}")
-            return
+        # Handle everything that is waiting, not one message per loop: drive commands
+        # arrive several times a second and must not queue up behind each other.
+        timeout = 0.1
+        for _ in range(50):
+            try:
+                message = self.network_service.receive_message_with_timeout(timeout=timeout)
+            except Exception as exc:
+                logger.debug(f"Error reading remote command: {exc}")
+                return
+            if not message:
+                return
+            timeout = 0.0
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                logger.warning("Received malformed remote command")
+                continue
+            self._process_remote_command(payload)
 
-        if not message:
-            return
+    def _live_status(self) -> dict:
+        """Live fields the dashboard shows (sent with every heartbeat and on changes)."""
+        return {
+            "motors": self.motors is not None,
+            "auto_spray": self.spray.auto_enabled,
+            "spraying": self.spray.spraying,
+            "driving": self.drive.direction,
+        }
 
-        try:
-            payload = json.loads(message)
-        except json.JSONDecodeError:
-            logger.warning("Received malformed remote command")
-            return
+    def _send_live_status(self) -> None:
+        self._send_telemetry({"type": "live", **self._live_status()})
 
-        self._process_remote_command(payload)
+    def _on_spray(self, event: dict) -> None:
+        """A spray finished: report it (for history) and the new live status."""
+        self._send_telemetry(event)
+        self._send_live_status()
 
     def _on_detection(self, detections: list) -> None:
         if detections:
@@ -621,21 +661,39 @@ class RobotApplication:
 
         if command == "move":
             direction = str(payload.get("direction", "stop")).strip().lower()
-            direction_map = {
-                "forward": MovementDirection.FORWARD,
-                "backward": MovementDirection.BACKWARD,
-                "left": MovementDirection.LEFT,
-                "right": MovementDirection.RIGHT,
-                "stop": MovementDirection.STOP,
-            }
-            if direction not in direction_map:
+            try:
+                movement = MovementDirection(direction)
+            except ValueError:
                 logger.warning(f"Unsupported move direction: {direction}")
                 return
-            self._execute_movement(direction_map[direction])
+            try:
+                speed_scale = float(payload.get("speed", 100)) / 100.0
+            except (TypeError, ValueError):
+                speed_scale = 1.0
+            self.drive.drive(movement, speed_scale)
             return
 
         if command in {"halt", "pause"}:
-            self._execute_movement(MovementDirection.STOP)
+            # Stop everything: wheels and any spray in progress.
+            self.spray.cancel()
+            self.drive.stop("halt command")
+            if self.motors is not None:
+                self.motors.stop()
+            self._send_live_status()
+            return
+
+        if command == "spray":
+            try:
+                duration = float(payload.get("duration", configs.SPRAY_DURATION))
+            except (TypeError, ValueError):
+                duration = configs.SPRAY_DURATION
+            if self.spray.spray(duration, trigger="manual"):
+                self._send_live_status()
+            return
+
+        if command == "set_auto_spray":
+            self.spray.set_auto(bool(payload.get("enabled")))
+            self._send_live_status()
             return
 
         if command in {"start_stream", "startstream", "stream_start"}:
@@ -728,33 +786,6 @@ class RobotApplication:
             os.execv(python_executable, argv)
         except Exception as exc:
             logger.error(f"Process reboot failed: {exc}")
-
-    def _execute_movement(self, direction: MovementDirection) -> None:
-        if self.motors is None:
-            logger.error("Cannot execute movement: motor controller unavailable")
-            return
-
-        if direction != MovementDirection.STOP and not self.state_machine.can_move() and not self.state_machine.is_ready():
-            logger.warning("Ignoring movement command because robot is not ready")
-            return
-
-        if direction == MovementDirection.STOP:
-            self.motors.stop()
-            if self.state_machine.is_in_state(RobotState.DETECTING):
-                self.state_machine.transition_to(
-                    RobotState.READY,
-                    reason="Stopped from detection",
-                )
-            return
-
-        if self.motors.move(direction):
-            if self.state_machine.is_ready():
-                self.state_machine.transition_to(
-                    RobotState.REMOTE_CONTROL,
-                    reason=f"Remote move {direction.value}",
-                )
-        else:
-            logger.error(f"Failed to execute movement: {direction.value}")
 
     def _send_telemetry(self, payload: dict) -> None:
         if not self.network_service.is_connected():
@@ -902,6 +933,7 @@ class RobotApplication:
         self._stop_all_movement(f"watchdog failure ({target_name})")
 
     def _stop_all_movement(self, reason: Optional[str] = None) -> None:
+        self.spray.cancel()
         if reason:
             logger.warning(f"Stopping all movement due to emergency: {reason}")
         else:

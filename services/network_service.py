@@ -61,6 +61,8 @@ class NetworkService:
         self._control_inbox: "queue.Queue[str]" = queue.Queue()
         self._control_outbox: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._control_state_provider: Optional[Callable[[], str]] = None
+        # Extra live fields for each heartbeat (motors, auto-spray, spraying, driving).
+        self._control_status_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self._control_robot_id = self.robot_id
         self._control_heartbeat_interval = heartbeat_interval
 
@@ -219,6 +221,7 @@ class NetworkService:
         robot_id: Optional[str] = None,
         state_provider: Optional[Callable[[], str]] = None,
         wait_timeout: Optional[float] = None,
+        status_provider: Optional[Callable[[], Dict[str, Any]]] = None,
     ) -> bool:
         """Start the control connection and wait up to wait_timeout for it.
 
@@ -232,6 +235,7 @@ class NetworkService:
             self._control_connected_event.clear()
             self._control_robot_id = robot_id or self.robot_id
             self._control_state_provider = state_provider
+            self._control_status_provider = status_provider
             self._control_thread = threading.Thread(target=self._control_worker, name="control-ws", daemon=True)
             self._control_thread.start()
 
@@ -424,6 +428,11 @@ class NetworkService:
                 "state": self._state_value(),
                 "timestamp": time.time(),
             }
+            if self._control_status_provider is not None:
+                try:
+                    heartbeat.update(self._control_status_provider())
+                except Exception:
+                    logger.exception("Status provider failed")
             try:
                 logger.debug("Sending heartbeat for %s", self._control_robot_id)
                 await websocket.send(json.dumps(heartbeat))

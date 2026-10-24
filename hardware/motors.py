@@ -148,7 +148,7 @@ class MotorController:
         """Check if motors are in healthy state."""
         return self._is_healthy
 
-    def move(self, direction: MovementDirection) -> bool:
+    def move(self, direction: MovementDirection, speed_scale: float = 1.0) -> bool:
         """
         Execute movement in specified direction.
         
@@ -167,12 +167,12 @@ class MotorController:
             return False
 
         try:
-            success = self._arduino.move(direction.value)
+            success = self._arduino.move(direction.value, speed_scale)
             
             if success:
                 self._current_direction = direction
                 self._last_movement_time = time.time()
-                logger.info(f"Move command: {direction.value}")
+                logger.debug(f"Move command: {direction.value} at {speed_scale:.0%}")
             else:
                 logger.warning(f"Move command failed: {direction.value}")
                 if direction != MovementDirection.STOP:

@@ -90,6 +90,41 @@ ARDUINO_RECONNECT_DELAY = 1.0
 # MOTOR CONFIGURATION
 # ============================================================================
 
+# Wiring: which motor IDs (0-3) are on each side, and which direction value (0 or 1)
+# turns that side's wheels forward. Find these with tools/hardware_test.py.
+def _env_ids(name: str, default: str) -> tuple:
+    try:
+        return tuple(int(v) for v in os.getenv(name, default).split(",") if v.strip())
+    except ValueError:
+        return tuple(int(v) for v in default.split(","))
+
+
+LEFT_MOTORS = _env_ids("LEFT_MOTORS", "0,2")
+RIGHT_MOTORS = _env_ids("RIGHT_MOTORS", "1,3")
+LEFT_FORWARD_DIRECTION = 1 if _env_int("LEFT_FORWARD_DIRECTION", 1) else 0
+RIGHT_FORWARD_DIRECTION = 1 if _env_int("RIGHT_FORWARD_DIRECTION", 1) else 0
+# PWM (0-255) at 100% speed for driving straight and for turning on the spot.
+DRIVE_SPEED = max(0, min(255, _env_int("DRIVE_SPEED", 200)))
+TURN_SPEED = max(0, min(255, _env_int("TURN_SPEED", 175)))
+# Manual driving is hold-to-drive: the dashboard repeats "move" while a key is held.
+# If no move arrives for this long (released key, closed tab, lost Wi-Fi) the robot stops.
+DRIVE_COMMAND_TIMEOUT = _env_float("DRIVE_COMMAND_TIMEOUT", 1.0)
+
+# ============================================================================
+# SPRAYER
+# ============================================================================
+
+PUMP_SPEED = max(0, min(255, _env_int("PUMP_SPEED", 255)))
+# Direction value (0 or 1) that makes the pump spray; find it with tools/hardware_test.py.
+PUMP_DIRECTION = 1 if _env_int("PUMP_DIRECTION", 1) else 0
+# Auto-spray is always OFF when the robot starts; switch it on from the dashboard.
+AUTO_SPRAY_MIN_CONFIDENCE = _env_float("AUTO_SPRAY_MIN_CONFIDENCE", 0.7)
+SPRAY_DURATION = _env_float("SPRAY_DURATION", 1.0)
+# No new automatic spray within this many seconds of the last one.
+SPRAY_COOLDOWN = _env_float("SPRAY_COOLDOWN", 10.0)
+# Upper limit for any spray (manual included); the Arduino's own failsafe stops at 6 s.
+SPRAY_MAX_DURATION = min(5.0, _env_float("SPRAY_MAX_DURATION", 5.0))
+
 # Motor response verification parameters
 MOTOR_EXPECTED_SPEED = 200  # Expected PWM value when moving (0-255)
 MOTOR_MOVEMENT_VERIFY_TIMEOUT = 1.0  # Seconds to verify movement

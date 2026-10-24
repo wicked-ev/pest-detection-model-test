@@ -21,7 +21,8 @@ import logging
 from typing import Optional, Sequence
 from enum import Enum
 from dataclasses import dataclass
-from threading import Event, Lock, Thread
+import functools
+from threading import Event, Lock, RLock, Thread
 
 # pyserial provides the "serial" module. A different PyPI package is also called "serial"
 # and has no serial.Serial; treat that like pyserial being missing instead of crashing at import.
@@ -86,6 +87,17 @@ class ArduinoCommunicationError(Exception):
     pass
 
 
+def _one_exchange(method):
+    """Run a full write-then-wait-for-reply exchange without other commands interleaving."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._exchange_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class ArduinoConnection:
     """
     Manages serial communication with Arduino Uno.
@@ -132,6 +144,9 @@ class ArduinoConnection:
 
         self._serial: Optional["serial.Serial"] = None
         self._connection_lock = Lock()
+        # One command/reply exchange at a time. Replies share one queue, so without this
+        # a watchdog ping and a drive command could take (or clear) each other's "OK".
+        self._exchange_lock = RLock()
         self._is_connected = False
         self._response_queue: Queue[str] = Queue(maxsize=100)
         self._reader_thread: Optional[Thread] = None
@@ -165,7 +180,8 @@ class ArduinoConnection:
         """
         if self._is_connected and self._serial and self._serial.is_open:
             return True
-        if serial is None:
+        simulated = self.port.strip().lower() == "simulated"
+        if serial is None and not simulated:
             logger.error("Cannot use the Arduino: pyserial is not available (%s)", _SERIAL_IMPORT_ERROR)
             return False
 
@@ -178,15 +194,20 @@ class ArduinoConnection:
                     )
 
                     self._response_queue = Queue(maxsize=100)
-                    self._serial = serial.Serial(
-                        port=self.port,
-                        baudrate=self.baudrate,
-                        timeout=self._read_timeout,
-                        write_timeout=self.write_timeout,
-                    )
+                    if simulated:
+                        # Software stand-in for the board (ARDUINO_PORT=simulated).
+                        from hardware.simulated_arduino import SimulatedSerial
 
-                    # Give Arduino time to reset and settle before use
-                    time.sleep(3.0)
+                        self._serial = SimulatedSerial()
+                    else:
+                        self._serial = serial.Serial(
+                            port=self.port,
+                            baudrate=self.baudrate,
+                            timeout=self._read_timeout,
+                            write_timeout=self.write_timeout,
+                        )
+                        # Give Arduino time to reset and settle before use
+                        time.sleep(3.0)
                     self._serial.reset_input_buffer()
                     self._serial.reset_output_buffer()
 
@@ -321,6 +342,7 @@ class ArduinoConnection:
             logger.error(f"Emergency stop failed: {e}")
             return False
 
+    @_one_exchange
     def send_command(
         self,
         command: ArduinoCommand,
@@ -389,6 +411,7 @@ class ArduinoConnection:
             logger.error("Failed to check motors")
             return False
 
+    @_one_exchange
     def get_hardware_status(self) -> Optional[HardwareStatus]:
         """
         Request full hardware status from Arduino.
@@ -441,51 +464,48 @@ class ArduinoConnection:
             logger.error(f"Failed to get status: {e}")
             return None
 
-    def move(self, direction: str) -> bool:
-        """
-        Send movement command to Arduino.
-        
-        Args:
-            direction: 'forward', 'backward', 'left', 'right', 'stop'
-            
-        Returns:
-            True if command sent successfully
-        """
-        direction_map = {
-            "forward": (0, 200, 1, 1, 200, 1),    # (M0_spd, M0_dir, M1_spd, M1_dir, ...)
-            "backward": (0, 200, 0, 1, 200, 0),
-            "left": (0, 175, 0, 1, 175, 1),
-            "right": (0, 175, 1, 1, 175, 0),
-            "stop": (0, 0, 0, 1, 0, 0),
-        }
+    def move(self, direction: str, speed_scale: float = 1.0) -> bool:
+        """Drive in a direction: 'forward', 'backward', 'left', 'right' or 'stop' (wheels only).
 
-        if direction not in direction_map:
+        Left/right turn on the spot (one side forward, the other backward).
+        Which motors form each side, and which direction value is "forward" for each
+        side, come from configs (LEFT_MOTORS, LEFT_FORWARD_DIRECTION, ...).
+        speed_scale (0-1) scales DRIVE_SPEED / TURN_SPEED.
+        """
+        import configs
+
+        scale = max(0.0, min(1.0, float(speed_scale)))
+        left_fwd = configs.LEFT_FORWARD_DIRECTION
+        right_fwd = configs.RIGHT_FORWARD_DIRECTION
+        drive = int(round(configs.DRIVE_SPEED * scale))
+        turn = int(round(configs.TURN_SPEED * scale))
+        # (left speed, left direction, right speed, right direction)
+        plans = {
+            "forward": (drive, left_fwd, drive, right_fwd),
+            "backward": (drive, 1 - left_fwd, drive, 1 - right_fwd),
+            "left": (turn, 1 - left_fwd, turn, right_fwd),
+            "right": (turn, left_fwd, turn, 1 - right_fwd),
+            "stop": (0, left_fwd, 0, right_fwd),
+        }
+        if direction not in plans:
             logger.error(f"Invalid direction: {direction}")
             return False
+        # "stop" sets only the wheels to 0: STOP_ALL would also stop a spray in progress.
+        # (stop_all() remains the emergency stop for everything.)
 
-        try:
-            motor_0_spd, motor_0_dir, motor_1_spd, motor_1_dir, motor_2_spd, motor_2_dir = direction_map[direction]
-            
-            # Set motor 0
-            if not self.set_motor(0, motor_0_spd, motor_0_dir):
-                return False
-            
-            # Set motor 1
-            if not self.set_motor(1, motor_1_spd, motor_1_dir):
-                return False
-            
-            # Set motors 2 and 3 (usually same as 0 and 1)
-            if not self.set_motor(2, motor_0_spd, motor_0_dir):
-                return False
-            
-            if not self.set_motor(3, motor_1_spd, motor_1_dir):
-                return False
-            
-            return True
-        except Exception as e:
-            logger.error(f"Move command failed: {e}")
-            return False
+        left_speed, left_dir, right_speed, right_dir = plans[direction]
+        with self._exchange_lock:
+            for motor_id in configs.LEFT_MOTORS:
+                if not self.set_motor(motor_id, left_speed, left_dir):
+                    self.stop_all()
+                    return False
+            for motor_id in configs.RIGHT_MOTORS:
+                if not self.set_motor(motor_id, right_speed, right_dir):
+                    self.stop_all()
+                    return False
+        return True
 
+    @_one_exchange
     def set_motor(self, motor_id: int, speed: int, direction: int) -> bool:
         """
         Set speed and direction for a specific motor.
@@ -525,6 +545,7 @@ class ArduinoConnection:
             logger.error(f"Set motor {motor_id} failed: {e}")
             return False
 
+    @_one_exchange
     def set_pump(self, speed: int, direction: int) -> bool:
         """
         Set speed and direction for the pump motor.
@@ -559,6 +580,7 @@ class ArduinoConnection:
             logger.error(f"Set pump failed: {e}")
             return False
 
+    @_one_exchange
     def stop_all(self) -> bool:
         """
         Stop all motors and pump.

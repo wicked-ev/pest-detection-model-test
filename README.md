@@ -67,11 +67,12 @@ Set `WIFI_MANAGEMENT_ENABLED=false` if the OS already manages Wi-Fi.
 Useful for testing against the server:
 
 ```bash
-CAMERA_BACKENDS=synthetic ARDUINO_ENABLED=false WIFI_MANAGEMENT_ENABLED=false \
+CAMERA_BACKENDS=synthetic ARDUINO_PORT=simulated WIFI_MANAGEMENT_ENABLED=false \
 SERVER_HOST=127.0.0.1 python app.py
 ```
 
-`synthetic` draws a moving test pattern instead of using a camera.
+`synthetic` draws a moving test pattern instead of using a camera, and `simulated` stands in
+for the motor board, so driving and spraying can be tried from the dashboard.
 
 ## Tests
 
@@ -79,7 +80,31 @@ SERVER_HOST=127.0.0.1 python app.py
 python -m pytest
 ```
 
+## Driving and spraying
+
+**First, find the wiring.** With the wheels off the ground and `app.py` stopped:
+
+```bash
+.venv/bin/python tools/hardware_test.py
+```
+
+It runs each motor and the pump briefly, asks what happened, and prints the `LEFT_MOTORS`,
+`RIGHT_MOTORS`, `*_FORWARD_DIRECTION` and `PUMP_DIRECTION` lines for `.env`.
+
+**Driving** is hold-to-drive from the dashboard (buttons, or arrows / WASD, Space stops).
+The dashboard repeats the command while a key is held; if commands stop arriving for
+`DRIVE_COMMAND_TIMEOUT` seconds (released key, closed tab, lost Wi-Fi) the robot stops itself.
+
+**Spraying:** "Spray now" in the dashboard, or **auto-spray** (off at every start): when a pest is
+detected with at least `AUTO_SPRAY_MIN_CONFIDENCE`, the robot stops its wheels, sprays for
+`SPRAY_DURATION` seconds, and then waits `SPRAY_COOLDOWN` seconds before it may spray again.
+It stays stopped afterwards. Sprays show on the video and in the dashboard history.
+
+**Without the hardware:** `ARDUINO_PORT=simulated` uses a software stand-in for the motor board
+that answers like the real firmware and logs every motor/pump change.
+
 ## Remote commands (from the dashboard)
 
-`start_stream`, `stop_stream`, `halt` (stop the motors), `reboot` (restarts this program),
-`shutdown` (stops this program), plus `move` with a `direction`.
+`start_stream`, `stop_stream`, `move` (`direction`: forward/backward/left/right/stop,
+`speed`: 10-100 %), `halt` (stop wheels and sprayer), `spray` (`duration` in seconds),
+`set_auto_spray` (`enabled`), `reboot` (restarts this program), `shutdown` (stops this program).
