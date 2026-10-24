@@ -3,7 +3,7 @@ name = "pest-detection-robot"
 version = "0.2.0"
 description = "Raspberry Pi software for the pest detection robot"
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10"
 # Small packages with ready-made builds for the Pi (from piwheels or apt).
 # Model runtimes are optional extras: on a 32-bit Pi they may not install at all,
 # and the robot then sends frames to the server for detection instead.
