@@ -13,6 +13,7 @@ import numpy as np
 from .base import BaseCameraBackend, CameraBackendError
 from .opencv_camera import OpenCVCameraBackend
 from .picamera2_camera import Picamera2Backend
+from .synthetic_camera import SyntheticCameraBackend
 from .v4l2_camera import V4L2CameraBackend
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ class CameraBackendFactory:
         "picamera2": Picamera2Backend,
         "opencv": OpenCVCameraBackend,
         "v4l2": V4L2CameraBackend,
+        # Test frames for running without a camera; only used when listed in CAMERA_BACKENDS.
+        "synthetic": SyntheticCameraBackend,
     }
 
     @classmethod
@@ -110,7 +113,10 @@ class CameraBackendFactory:
                 with open(cache_path) as f:
                     data = json.load(f)
                     cached_name = data.get("camera_backend")
-                    if cached_name:
+                    preference = config.backend_preference or ("picamera2", "opencv", "v4l2")
+                    # A cached choice must still be allowed by the current preference list,
+                    # otherwise changing CAMERA_BACKENDS would be ignored.
+                    if cached_name and cached_name in preference:
                         logger.debug("Trying cached camera backend: %s", cached_name)
                         backend = cls.create_backend(cached_name, config)
                         if backend is not None:

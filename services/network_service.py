@@ -13,6 +13,7 @@ import queue
 import socket
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from socket import socket as socket_obj
 from typing import Any, Callable, Dict, Optional
@@ -69,6 +70,16 @@ class NetworkService:
         self._stream_connected_event = threading.Event()
         self._stream_robot_id = self.robot_id
         self._stream_model_name: Optional[str] = None
+        # "server": the server runs detection on our frames and sends results back.
+        # "monitor": we run detection ourselves and send frames plus results for monitoring.
+        self._stream_mode = "server"
+        # Monitor mode: (detections message, the frame it belongs to), sent before live frames.
+        # Bounded, so a slow link drops the oldest results instead of growing memory.
+        self._stream_detections: "deque[tuple[str, bytes]]" = deque(maxlen=8)
+        self._stream_detections_lock = threading.Lock()
+        # Set by a session once it connects; the retry loop uses it to reset its backoff.
+        self._control_session_connected = False
+        self._stream_session_connected = False
         self._stream_detection_callback: Optional[Callable[[list], None]] = None
         self._stream_latest_frame_lock = threading.Lock()
         self._stream_latest_frame_bytes: Optional[bytes] = None
@@ -83,6 +94,17 @@ class NetworkService:
 
     def _ws_base_url(self) -> str:
         return f"ws://{self.server_host}:{self.server_port}"
+
+    def _ws_connect(self, uri: str) -> Any:
+        """Open a server websocket, sending the shared robot key as a header when configured."""
+        options: Dict[str, Any] = {"open_timeout": 10.0, "close_timeout": 5.0, "ping_interval": None}
+        robot_key = getattr(configs, "ROBOT_KEY", "")
+        if robot_key:
+            headers = {"X-Robot-Key": robot_key}
+            # websockets >= 14 names this argument additional_headers; older releases use extra_headers.
+            major = int(str(getattr(websockets, "__version__", "14")).split(".")[0])
+            options["additional_headers" if major >= 14 else "extra_headers"] = headers
+        return websockets.connect(uri, **options)
 
     def _state_value(self) -> str:
         if self._control_state_provider is None:
@@ -196,80 +218,96 @@ class NetworkService:
         stop_event: Optional[threading.Event] = None,
         robot_id: Optional[str] = None,
         state_provider: Optional[Callable[[], str]] = None,
+        wait_timeout: Optional[float] = None,
     ) -> bool:
-        """Connect to the remote control websocket and keep it alive in a worker thread."""
-        if self._control_thread and self._control_thread.is_alive():
-            return True
+        """Start the control connection and wait up to wait_timeout for it.
 
-        self._control_stop_event.clear()
-        self._control_shutdown_event = stop_event
-        self._control_connected_event.clear()
-        self._control_robot_id = robot_id or self.robot_id
-        self._control_state_provider = state_provider
+        The connection runs in a background thread that keeps reconnecting until
+        disconnect() is called, so a server that is down at startup is picked up later.
+        Returns whether it is connected now.
+        """
+        if not (self._control_thread and self._control_thread.is_alive()):
+            self._control_stop_event.clear()
+            self._control_shutdown_event = stop_event
+            self._control_connected_event.clear()
+            self._control_robot_id = robot_id or self.robot_id
+            self._control_state_provider = state_provider
+            self._control_thread = threading.Thread(target=self._control_worker, name="control-ws", daemon=True)
+            self._control_thread.start()
 
-        self._control_thread = threading.Thread(target=self._control_worker, name="control-ws", daemon=True)
-        self._control_thread.start()
-
-        wait_timeout = max(5.0, float(self.server_connection_attempts) * float(self.connection_retry_delay))
+        if wait_timeout is None:
+            wait_timeout = getattr(configs, "SERVER_CONNECT_WAIT", 15.0)
         deadline = time.time() + wait_timeout
         while time.time() < deadline:
-            if self._control_connected_event.wait(timeout=min(0.1, max(0.0, deadline - time.time()))):
+            if self._control_connected_event.wait(timeout=0.1):
                 return True
-
             if stop_event is not None and stop_event.is_set():
-                logger.info("Control websocket connection cancelled during startup")
-                self._control_stop_event.set()
-                if self._control_thread:
-                    self._control_thread.join(timeout=2.0)
-                self._control_thread = None
-                self._control_connected = False
-                self._is_connected = self.client is not None
-                self._control_shutdown_event = None
                 return False
-
-        logger.error("Timed out while establishing control websocket connection")
-        self._control_stop_event.set()
-        if self._control_thread:
-            self._control_thread.join(timeout=2.0)
-        self._control_thread = None
-        self._control_connected = False
-        self._is_connected = self.client is not None
-        self._control_shutdown_event = None
+        logger.warning(
+            "Server %s not reachable yet; continuing and retrying in the background",
+            self._ws_base_url(),
+        )
         return False
 
     def start_stream_channel(
         self,
         model_name: Optional[str] = None,
         robot_id: Optional[str] = None,
+        mode: str = "server",
+        wait_timeout: float = 0.0,
     ) -> bool:
-        """Connect to the remote stream websocket and keep sending latest frames."""
+        """Start sending frames to the server; it keeps reconnecting in the background.
+
+        mode "server": the server detects pests in our frames and returns the results.
+        mode "monitor": we detect locally; frames and send_stream_detections() results
+        are sent so the server can show and record them.
+        Returns whether the stream is connected within wait_timeout (0 = don't wait).
+        """
         if self._stream_thread and self._stream_thread.is_alive():
-            return True
+            if self._stream_mode == mode:
+                return self._stream_connected
+            self.stop_stream_channel()
 
         self._stream_stop_event = threading.Event()
         self._stream_connected_event.clear()
         self._stream_robot_id = robot_id or self.robot_id
         self._stream_model_name = model_name
+        self._stream_mode = mode
         self._stream_latest_frame_seq = 0
         self._stream_last_sent_seq = 0
         self._stream_latest_frame_bytes = None
         self._stream_frame_update_ts = None
         self._stream_last_sent_ts = None
+        with self._stream_detections_lock:
+            self._stream_detections.clear()
 
         self._stream_thread = threading.Thread(target=self._stream_worker, name="stream-ws", daemon=True)
         self._stream_thread.start()
+        return self._stream_connected_event.wait(timeout=wait_timeout) if wait_timeout > 0 else False
 
-        wait_timeout = max(5.0, float(self.server_connection_attempts) * float(self.connection_retry_delay))
-        if self._stream_connected_event.wait(timeout=wait_timeout):
-            return True
+    def get_stream_mode(self) -> Optional[str]:
+        if self._stream_thread and self._stream_thread.is_alive():
+            return self._stream_mode
+        return None
 
-        logger.error("Timed out while establishing stream websocket connection")
-        self._stream_stop_event.set()
-        if self._stream_thread:
-            self._stream_thread.join(timeout=2.0)
-        self._stream_thread = None
-        self._stream_connected = False
-        return False
+    def send_stream_detections(self, detections: list, image_size: tuple, frame_bytes: bytes) -> None:
+        """Monitor mode: queue our own detections together with the frame they came from."""
+        if not frame_bytes:
+            return
+        message = json.dumps({
+            "type": "detections",
+            "image_size": [int(image_size[0]), int(image_size[1])],
+            "detections": [
+                {
+                    "class": str(d.get("class")),
+                    "confidence": float(d.get("confidence", 0.0)),
+                    "bbox": [float(v) for v in d.get("bbox", ())],
+                }
+                for d in detections
+            ],
+        })
+        with self._stream_detections_lock:
+            self._stream_detections.append((message, frame_bytes))
 
     def stop_stream_channel(self, timeout: float = 2.0) -> None:
         self._stream_stop_event.set()
@@ -288,12 +326,14 @@ class NetworkService:
             self._stream_frame_update_ts = time.time()
 
     def _control_worker(self) -> None:
-        backoff = max(1.0, float(self.connection_retry_delay))
+        base_delay = max(1.0, float(self.connection_retry_delay))
+        backoff = base_delay
         while not self._control_should_stop():
+            self._control_session_connected = False
             try:
                 asyncio.run(self._run_control_session())
             except Exception as exc:
-                logger.warning("Control websocket loop ended: %s", exc)
+                self._log_session_error("Control", exc)
 
             self._control_connected = False
             self._control_connected_event.clear()
@@ -301,8 +341,9 @@ class NetworkService:
             if self._control_should_stop():
                 break
 
-            time.sleep(backoff)
-            backoff = min(30.0, backoff * 2.0)
+            # After a working session reconnect quickly; while the server stays down, back off.
+            backoff = base_delay if self._control_session_connected else min(30.0, backoff * 2.0)
+            self._control_stop_event.wait(backoff)
 
     def _control_should_stop(self) -> bool:
         return self._control_stop_event.is_set() or (
@@ -316,10 +357,11 @@ class NetworkService:
         uri = f"{self._ws_base_url()}/ws/control/{quote_plus(self._control_robot_id)}"
         logger.info("Connecting control websocket: %s", uri)
 
-        async with websockets.connect(uri, open_timeout=10.0, close_timeout=5.0, ping_interval=None) as websocket:
+        async with self._ws_connect(uri) as websocket:
             self._control_connected = True
             self._is_connected = True
             self._control_connected_event.set()
+            self._control_session_connected = True
             logger.info("Control websocket connected")
 
             recv_task = asyncio.create_task(self._control_receive_loop(websocket))
@@ -383,43 +425,64 @@ class NetworkService:
                 "timestamp": time.time(),
             }
             try:
+                logger.debug("Sending heartbeat for %s", self._control_robot_id)
                 await websocket.send(json.dumps(heartbeat))
             except Exception:
                 logger.exception("Failed to send control websocket heartbeat")
                 raise
 
     def _stream_worker(self) -> None:
-        backoff = max(1.0, float(self.connection_retry_delay))
+        base_delay = max(1.0, float(self.connection_retry_delay))
+        backoff = base_delay
         while not self._stream_stop_event.is_set():
+            self._stream_session_connected = False
             try:
                 asyncio.run(self._run_stream_session())
             except Exception as exc:
-                logger.warning("Stream websocket loop ended: %s", exc)
+                self._log_session_error("Stream", exc)
 
             self._stream_connected = False
             self._stream_connected_event.clear()
             if self._stream_stop_event.is_set():
                 break
 
-            time.sleep(backoff)
-            backoff = min(30.0, backoff * 2.0)
+            backoff = base_delay if self._stream_session_connected else min(30.0, backoff * 2.0)
+            self._stream_stop_event.wait(backoff)
+
+    @staticmethod
+    def _log_session_error(kind: str, exc: Exception) -> None:
+        text = str(exc)
+        if "403" in text:
+            logger.error(
+                "%s connection rejected by the server (HTTP 403): "
+                "ROBOT_KEY in .env must match the server's ROBOT_KEY",
+                kind,
+            )
+        else:
+            logger.warning("%s websocket ended: %s", kind, text or type(exc).__name__)
 
     async def _run_stream_session(self) -> None:
         if websockets is None:
             raise RuntimeError("websockets package is not installed")
 
-        model_name = self._select_model_name()
-        query = f"?model={quote_plus(model_name)}" if model_name else ""
+        monitor = self._stream_mode == "monitor"
+        # In monitor mode the server runs no model, so there is no model to pick.
+        model_name = None if monitor else self._select_model_name()
+        if monitor:
+            query = "?mode=monitor"
+        else:
+            query = f"?model={quote_plus(model_name)}" if model_name else ""
         uri = f"{self._ws_base_url()}/ws/stream/{quote_plus(self._stream_robot_id)}{query}"
-        logger.info("Connecting stream websocket: %s", uri)
+        logger.info("Connecting stream websocket (%s mode): %s", self._stream_mode, uri)
 
-        async with websockets.connect(uri, open_timeout=10.0, close_timeout=5.0, ping_interval=None) as websocket:
+        async with self._ws_connect(uri) as websocket:
             self._stream_connected = True
             self._is_connected = True
             self._stream_connected_event.set()
+            self._stream_session_connected = True
             logger.info("Stream websocket connected")
 
-            if not model_name:
+            if not monitor and not model_name:
                 handshake_model = self._select_model_name()
                 if handshake_model:
                     await websocket.send(json.dumps({"model": handshake_model}))
@@ -488,6 +551,17 @@ class NetworkService:
 
     async def _stream_send_loop(self, websocket: Any) -> None:
         while not self._stream_stop_event.is_set():
+            # Monitor mode: our detections go first, each followed by its own frame,
+            # so the server pairs them correctly (one websocket keeps messages in order).
+            with self._stream_detections_lock:
+                pending = self._stream_detections.popleft() if self._stream_detections else None
+            if pending is not None:
+                message, detection_frame = pending
+                await websocket.send(message)
+                await websocket.send(detection_frame)
+                self._stream_last_sent_ts = time.time()
+                continue
+
             with self._stream_latest_frame_lock:
                 frame_seq = self._stream_latest_frame_seq
                 frame_bytes = self._stream_latest_frame_bytes
@@ -539,6 +613,10 @@ class NetworkService:
 
         self._is_connected = False
         return success
+
+    def is_remote_model_loaded(self) -> bool:
+        # TODO: unfinished; the empty body was a syntax error that stopped this module from importing.
+        raise NotImplementedError
 
     def is_connected(self) -> bool:
         """Return True when connected to any active server transport."""

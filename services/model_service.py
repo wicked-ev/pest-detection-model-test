@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
+import io
+
 import numpy as np
 from typing import Any
 
@@ -33,6 +35,49 @@ from .inference_backends import (
 
 logger = logging.getLogger(__name__)
 Listener = Callable[[List[Detection]], None]
+
+
+def encode_jpeg(frame: np.ndarray, quality: Optional[int] = None) -> bytes:
+    """Encode an RGB uint8 frame as JPEG; returns b"" if it cannot be encoded."""
+    quality = int(quality if quality is not None else getattr(configs, "JPEG_QUALITY", 75))
+    try:
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.fromarray(frame, mode="RGB").save(buffer, format="JPEG", quality=quality)
+        return buffer.getvalue()
+    except ImportError:
+        pass
+    except Exception:
+        logger.exception("JPEG encoding failed")
+        return b""
+    try:
+        import cv2
+
+        ok, jpeg = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return jpeg.tobytes() if ok else b""
+    except Exception:
+        logger.exception("JPEG encoding failed (neither Pillow nor OpenCV worked)")
+        return b""
+
+
+def _unpack_frame(res: Any) -> Tuple[Any, float, Optional[int]]:
+    """Normalize camera service results into (frame, timestamp, frame_id)."""
+    if isinstance(res, tuple):
+        if len(res) == 3:
+            return res[0], float(res[1]), res[2]
+        if len(res) == 2:
+            return res[0], float(res[1]), None
+    if isinstance(res, np.ndarray):
+        return res, time.time(), None
+    raise TypeError(f"Unsupported camera result type: {type(res)!r}")
+
+
+def _latest_frame(camera_service) -> Any:
+    try:
+        return camera_service.get_latest_metadata(copy=False)
+    except AttributeError:
+        return camera_service.get_latest(copy=False)
 
 
 class ModelService:
@@ -52,7 +97,7 @@ class ModelService:
         onnx_model_path: Optional[Path] = None,
         annotations_path: Optional[Path] = None,
         confidence_threshold: Optional[float] = None,
-        num_threads: int = 1,
+        num_threads: Optional[int] = None,
         backend_preference: Optional[Sequence[str]] = None,
         cache_dir: Optional[Path] = None,
     ):
@@ -87,7 +132,8 @@ class ModelService:
             onnx_model_path=self.onnx_model_path,
             annotations_path=self.annotations_path,
             confidence_threshold=self.confidence_threshold,
-            num_threads=num_threads,
+            # The Pi 3B+ has 4 cores; a single thread would leave three idle.
+            num_threads=num_threads if num_threads is not None else configs.MODEL_NUM_THREADS,
             backend_preference=self.backend_preference,
         )
         
@@ -105,6 +151,8 @@ class ModelService:
         self._remote_streaming_active = False
         self._last_remote_activity_ts: Optional[float] = None
         self._remote_network_service: Optional[Any] = None
+        # Set in monitor mode: local detections are also sent to the server through it.
+        self._monitor_network_service: Optional[Any] = None
 
     def get_backend_name(self) -> Optional[str]:
         """Get the name of the currently selected backend."""
@@ -124,6 +172,13 @@ class ModelService:
             self._backend_config,
             cache_path=self._backend_cache_path,
         )
+        return self._backend is not None
+
+    def has_runtime(self) -> bool:
+        """True if at least one inference runtime (tflite, onnx) is installed. Loads nothing."""
+        return bool(InferenceBackendFactory.create_backends(self._backend_config))
+
+    def is_model_loaded(self) -> bool:
         return self._backend is not None
 
     def verify_load(self) -> bool:
@@ -191,230 +246,76 @@ class ModelService:
         self.start_streaming(camera_service, throttle_fps)
 
     def start_remote_streaming(self, camera_service, network_service: Any, throttle_fps: Optional[float] = None) -> None:
-        """Stream encoded frames to remote server for server-side inference.
+        """Server mode: send frames to the server, which runs detection and returns results."""
+        self.start_frame_streaming(camera_service, network_service, fps=throttle_fps, mode="server")
 
-        Frames are JPEG-encoded locally and published as binary websocket frames
-        through the network service. The websocket worker keeps only the latest
-        frame, so faster capture does not build an unbounded queue.
+    def start_frame_streaming(
+        self,
+        camera_service,
+        network_service: Any,
+        fps: Optional[float] = None,
+        mode: str = "server",
+    ) -> None:
+        """Send JPEG frames to the server at up to `fps` frames per second.
+
+        mode "server": the server detects pests in these frames (fallback when the robot
+        cannot run the model). mode "monitor": the robot detects locally and these frames
+        are the live view; local detections are sent along by the inference loop.
+        The connection reconnects by itself; frames are only encoded while it is up.
         """
         if self._remote_thread and self._remote_thread.is_alive():
             return
-
-        # network_service must be connected
-        if not getattr(network_service, "is_connected", lambda: False)():
-            raise RuntimeError("Network service is not connected for remote streaming")
-
-        if not getattr(network_service, "start_stream_channel", None):
-            raise RuntimeError("Network service does not support websocket streaming")
+        fps = float(fps if fps else getattr(configs, "STREAM_FPS", 5.0))
 
         self._remote_stop_event.clear()
         self._remote_streaming_active = True
         self._remote_network_service = network_service
+        self._monitor_network_service = network_service if mode == "monitor" else None
+        network_service.start_stream_channel(robot_id=getattr(configs, "ROBOT_ID", None), mode=mode)
 
-        if not network_service.start_stream_channel(robot_id=getattr(configs, "ROBOT_ID", None)):
-            self._remote_streaming_active = False
-            self._remote_network_service = None
-            raise RuntimeError("Failed to establish websocket stream channel")
-
-        def encode_frame_to_jpeg_bytes(frame: np.ndarray) -> bytes:
-            try:
-                from PIL import Image
-                img = Image.fromarray(frame.astype(np.uint8), mode="RGB")
-                import io
-                stream = io.BytesIO()
-                img.save(stream, format="JPEG", quality=80)
-                return stream.getvalue()
-            except Exception:
-                try:
-                    import cv2
-                    _, jpeg = cv2.imencode(
-                        ".jpg",
-                        cv2.cvtColor(frame, cv2.COLOR_RGB2BGR),
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 80],
-                    )
-                    return jpeg.tobytes()
-                except Exception:
-                    logger.exception("Failed to encode frame to JPEG for remote streaming")
-                    return b""
-
-        def unpack_frame_result(res: Any) -> Tuple[Any, float, Optional[int]]:
-            """Normalize camera service results into (frame, timestamp, frame_id)."""
-            if isinstance(res, dict):
-                frame = res.get("frame")
-                timestamp = float(res.get("timestamp", time.time()))
-                frame_id = res.get("frame_id")
-                return frame, timestamp, frame_id
-
-            if isinstance(res, tuple):
-                if len(res) == 3:
-                    frame, timestamp, frame_id = res
-                    return frame, float(timestamp), frame_id
-                if len(res) == 2:
-                    frame, timestamp = res
-                    return frame, float(timestamp), None
-
-            if isinstance(res, np.ndarray):
-                return res, time.time(), None
-
-            raise TypeError(f"Unsupported camera result type: {type(res)!r}")
-
-        def safe_frame_shape(frame: Any) -> Any:
-            return getattr(frame, "shape", None)
-
+        stop = self._remote_stop_event
+        interval = 1.0 / fps
 
         def loop() -> None:
-            logger.info("Remote streaming loop started")
-
-            min_frame_interval = 1.0 / throttle_fps if throttle_fps else 0.0
-            last_encoded_ts = 0.0
+            logger.info("Frame streaming started (%s mode, %.1f fps)", mode, fps)
+            next_due = 0.0
             last_frame_id: Optional[int] = None
-            frame_counter = 0
-            received_frames = 0
-            encoded_frames = 0
-            skipped_duplicates = 0
-            skipped_frame_skip = 0
-            skipped_throttle = 0
-            encode_failures = 0
-
-            logger.info(
-                "Streaming config: throttle_fps=%s, min_frame_interval=%.4f, frame_skip=%s",
-                throttle_fps,
-                min_frame_interval,
-                configs.FRAME_SKIP,
-            )
-
-            while not self._remote_stop_event.is_set():
-                try:
-                    res = camera_service.get_latest_metadata(copy=False)
-                except AttributeError:
-                    res = camera_service.get_latest(copy=False)
-                except Exception:
-                    logger.exception("Remote streaming frame fetch failed")
-                    time.sleep(0.01)
+            sent = encode_failures = 0
+            while not stop.is_set():
+                now = time.monotonic()
+                if now < next_due:
+                    stop.wait(next_due - now)
                     continue
-
+                # Encoding costs CPU on a Pi 3; skip it while nobody can receive the frames.
+                if not network_service.is_stream_connected():
+                    stop.wait(0.5)
+                    continue
+                try:
+                    res = _latest_frame(camera_service)
+                except Exception:
+                    logger.exception("Frame streaming could not read the camera")
+                    stop.wait(0.5)
+                    continue
                 if res is None:
-                    logger.debug("No frame available from camera service")
-                    time.sleep(0.005)
+                    stop.wait(0.05)
                     continue
-
-                try:
-                    frame, ts, frame_id = unpack_frame_result(res)
-                except Exception:
-                    logger.exception("Unexpected remote frame payload: %r", type(res))
-                    time.sleep(0.01)
+                frame, _, frame_id = _unpack_frame(res)
+                if frame_id is not None and frame_id == last_frame_id:
+                    stop.wait(0.01)  # no new frame yet
                     continue
-
-                received_frames += 1
-
-                if configs.STREAMING_LOGS_ENABLED:
-                    logger.debug(
-                        "Remote frame received: frame_id=%s timestamp=%s shape=%s received=%d",
-                        frame_id,
-                        ts,
-                        safe_frame_shape(frame),
-                        received_frames,
-                    )
-
-                if (
-                    frame_id is not None
-                    and last_frame_id is not None
-                    and frame_id == last_frame_id
-                ):
-                    skipped_duplicates += 1
-                    if configs.STREAMING_LOGS_ENABLED:
-                        logger.debug(
-                            "Skipping duplicate frame_id=%s (duplicate_skips=%d)",
-                            frame_id,
-                            skipped_duplicates,
-                        )
-                    time.sleep(0.005)
-                    continue
-
                 last_frame_id = frame_id
-                frame_counter += 1
+                next_due = now + interval
 
-                if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
-                    skipped_frame_skip += 1
-                    if configs.STREAMING_LOGS_ENABLED:
-                        logger.debug(
-                            "Skipping frame_id=%s due to FRAME_SKIP (counter=%s)",
-                            frame_id,
-                            frame_counter,
-                        )
-                    time.sleep(0.001)
-                    continue
-
-                if min_frame_interval and (time.time() - last_encoded_ts) < min_frame_interval:
-                    skipped_throttle += 1
-                    if configs.STREAMING_LOGS_ENABLED:
-                        logger.debug(
-                            "Skipping frame_id=%s due to FPS throttle",
-                            frame_id,
-                        )
-                    time.sleep(0.001)
-                    continue
-
-                try:
-                    if configs.STREAMING_LOGS_ENABLED:
-                        logger.debug(
-                            "Encoding remote frame_id=%s (processed=%d)",
-                            frame_id,
-                            frame_counter,
-                        )
-
-                    frame_bytes = encode_frame_to_jpeg_bytes(frame)
-
-                    if not frame_bytes:
-                        encode_failures += 1
-                        logger.warning(
-                            "Encoding returned empty payload for frame_id=%s (encode_failures=%d)",
-                            frame_id,
-                            encode_failures,
-                        )
-                        time.sleep(0.005)
-                        continue
-
-                    encoded_frames += 1
-                    if configs.STREAMING_LOGS_ENABLED:
-                        logger.debug(
-                            "Encoded frame_id=%s (jpeg size=%d bytes)",
-                            frame_id,
-                            len(frame_bytes),
-                        )
-
-                    try:
-                        network_service.update_stream_frame(frame_bytes)
-                        last_encoded_ts = time.time()
-                        if configs.STREAMING_LOGS_ENABLED:
-                            logger.debug("Published frame_id=%s to websocket stream buffer", frame_id)
-
-                    except Exception:
-                        logger.exception(
-                            "Failed to publish remote frame payload (frame_id=%s)",
-                            frame_id,
-                        )
-                        time.sleep(0.005)
-
-                except Exception:
+                frame_bytes = encode_jpeg(frame)
+                if not frame_bytes:
                     encode_failures += 1
-                    logger.exception(
-                        "Remote streaming loop encountered an error during encoding/sending (frame_id=%s, encode_failures=%d)",
-                        frame_id,
-                        encode_failures,
-                    )
-                    time.sleep(0.005)
+                    continue
+                network_service.update_stream_frame(frame_bytes)
+                self._last_remote_activity_ts = time.time()
+                sent += 1
+            logger.info("Frame streaming stopped (sent=%d encode_failures=%d)", sent, encode_failures)
 
-            logger.info(
-                "Remote streaming stopped (received=%d encoded=%d duplicate_skips=%d frame_skip_skips=%d throttle_skips=%d encode_failures=%d)",
-                received_frames,
-                encoded_frames,
-                skipped_duplicates,
-                skipped_frame_skip,
-                skipped_throttle,
-                encode_failures,
-            )
-        self._remote_thread = threading.Thread(target=loop, name="remote-stream", daemon=True)
+        self._remote_thread = threading.Thread(target=loop, name="frame-stream", daemon=True)
         self._remote_thread.start()
 
     def _ensure_backend(self) -> BaseInferenceBackend:
@@ -503,7 +404,7 @@ class ModelService:
                     res = camera_service.get_latest(copy=False)
 
                 if res is None:
-                    time.sleep(0.005)
+                    self._stop_event.wait(0.05)
                     continue
 
                 if len(res) == 3:
@@ -513,7 +414,7 @@ class ModelService:
                     frame_id = None
 
                 if frame_id is not None and last_frame_id is not None and frame_id == last_frame_id:
-                    time.sleep(0.005)
+                    self._stop_event.wait(0.01)  # no new frame yet
                     continue
 
                 last_frame_id = frame_id
@@ -521,8 +422,9 @@ class ModelService:
                 if configs.FRAME_SKIP and frame_counter % configs.FRAME_SKIP != 0:
                     continue
 
-                if min_frame_interval and (time.time() - last_infer) < min_frame_interval:
-                    time.sleep(0.001)
+                wait = min_frame_interval - (time.time() - last_infer)
+                if min_frame_interval and wait > 0:
+                    self._stop_event.wait(wait)
                     continue
 
                 last_infer = time.time()
@@ -533,11 +435,22 @@ class ModelService:
                     logger.exception("Inference loop encountered an error")
                     dets = []
                 self._dispatch(dets)
+                self._send_monitor_detections(dets, frame)
 
             logger.info("Inference streaming stopped")
 
         self._inference_thread = threading.Thread(target=loop, name="inference-stream", daemon=True)
         self._inference_thread.start()
+
+    def _send_monitor_detections(self, detections: List[Detection], frame: np.ndarray) -> None:
+        """Monitor mode: send local detections and their frame to the server."""
+        network = self._monitor_network_service
+        if not detections or network is None or not network.is_stream_connected():
+            return
+        frame_bytes = encode_jpeg(frame)
+        if frame_bytes:
+            height, width = frame.shape[:2]
+            network.send_stream_detections(detections, (width, height), frame_bytes)
 
     def stop_streaming(self, timeout: float = 2.0) -> None:
         # Stop local inference streaming
@@ -562,6 +475,7 @@ class ModelService:
         finally:
             self._remote_streaming_active = False
             self._remote_network_service = None
+            self._monitor_network_service = None
 
 
 if __name__ == "__main__":

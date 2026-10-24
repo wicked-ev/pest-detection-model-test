@@ -16,13 +16,28 @@ The Arduino is responsible ONLY for:
 High-level logic remains on the Raspberry Pi.
 """
 
-import serial
 import time
 import logging
 from typing import Optional, Sequence
 from enum import Enum
 from dataclasses import dataclass
 from threading import Event, Lock, Thread
+
+# pyserial provides the "serial" module. A different PyPI package is also called "serial"
+# and has no serial.Serial; treat that like pyserial being missing instead of crashing at import.
+try:
+    import serial
+
+    if not hasattr(serial, "Serial"):
+        raise ImportError('the installed "serial" package is not pyserial (pip install pyserial)')
+    SerialException = serial.SerialException
+    _SERIAL_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as _exc:
+    serial = None
+    _SERIAL_IMPORT_ERROR = _exc
+
+    class SerialException(Exception):
+        """Stand-in so except clauses work when pyserial is unavailable."""
 from queue import Queue, Empty, Full
 
 logger = logging.getLogger(__name__)
@@ -115,7 +130,7 @@ class ArduinoConnection:
         self.max_reconnect_attempts = max_reconnect_attempts
         self.reconnect_delay = reconnect_delay
 
-        self._serial: Optional[serial.Serial] = None
+        self._serial: Optional["serial.Serial"] = None
         self._connection_lock = Lock()
         self._is_connected = False
         self._response_queue: Queue[str] = Queue(maxsize=100)
@@ -150,6 +165,9 @@ class ArduinoConnection:
         """
         if self._is_connected and self._serial and self._serial.is_open:
             return True
+        if serial is None:
+            logger.error("Cannot use the Arduino: pyserial is not available (%s)", _SERIAL_IMPORT_ERROR)
+            return False
 
         for attempt in range(self.max_reconnect_attempts):
             try:
@@ -182,7 +200,7 @@ class ArduinoConnection:
 
                     return True
 
-            except (serial.SerialException, OSError) as e:
+            except (SerialException, OSError) as e:
                 logger.warning(
                     f"Connection attempt {attempt + 1} failed: {e}"
                 )
@@ -232,7 +250,7 @@ class ArduinoConnection:
             self._serial.write(message.encode())
             self._serial.flush()
             self._last_command_time = time.time()
-        except serial.SerialException as e:
+        except SerialException as e:
             logger.error(f"Serial write failed: {e}")
             self._is_connected = False
             raise ArduinoCommunicationError(f"Serial communication failed: {e}")
@@ -642,7 +660,7 @@ class ArduinoConnection:
                             except Empty:
                                 pass
                             self._response_queue.put_nowait(line)
-            except (serial.SerialException, UnicodeDecodeError) as e:
+            except (SerialException, UnicodeDecodeError) as e:
                 logger.warning(f"Reader thread error: {e}")
                 self._is_connected = False
                 if self._auto_reconnect:

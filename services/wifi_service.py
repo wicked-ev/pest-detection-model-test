@@ -22,6 +22,21 @@ from services.network_service import NetworkService
 
 logger = logging.getLogger(__name__)
 
+# NetworkManager connection name for the setup hotspot, so it can be stopped by name
+# without disconnecting the Wi-Fi network the robot has just joined.
+HOTSPOT_CONNECTION_NAME = "robot-setup-hotspot"
+
+
+def _run(cmd: list[str], timeout: float) -> Optional[subprocess.CompletedProcess]:
+    """Run a system command; None if the tool is missing or it timed out."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        logger.debug("Command not available: %s", cmd[0])
+    except subprocess.TimeoutExpired:
+        logger.warning("Command timed out after %.0fs: %s", timeout, " ".join(cmd[:4]))
+    return None
+
 
 @dataclass
 class WiFiCredentials:
@@ -48,8 +63,11 @@ class WiFiManager:
         try:
             data = json.loads(self.credentials_path.read_text())
 
+            # Accept a single {"ssid", "password"} object as well as a list of them.
+            if isinstance(data, dict):
+                data = [data]
             if not isinstance(data, list):
-                logger.warning("WiFi credentials file must contain a list")
+                logger.warning("WiFi credentials file must contain an object or a list")
                 return []
 
             for item in data:
@@ -95,20 +113,19 @@ class WiFiManager:
                 return False
         return True
 
-    def is_wifi_connected(self, interface="wlan0") -> bool:
+    def is_wifi_connected(self, interface: Optional[str] = None) -> bool:
+        """True if the Wi-Fi interface is associated with a network.
 
-        try:
-            result = subprocess.run(
-                ["iwgetid", interface, "--raw"],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                )
-            ssid = result.stdout.strip()
-            return bool(ssid)
-        except subprocess.CalledProcessError:
-            return False
-    
+        Tries iwgetid first, then NetworkManager; neither tool being installed
+        (e.g. on a PC) means "not connected" rather than a crash.
+        """
+        interface = interface or configs.HOTSPOT_INTERFACE
+        result = _run(["iwgetid", interface, "--raw"], timeout=3)
+        if result is not None and result.returncode == 0:
+            return bool(result.stdout.strip())
+        result = _run(["nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", interface], timeout=5)
+        return result is not None and result.returncode == 0 and "(connected)" in result.stdout
+
     def connect_saved_networks(self) -> bool:
         """Attempt to connect to previously saved WiFi credentials."""
         credentials = self.load_saved_credentials()
@@ -119,74 +136,57 @@ class WiFiManager:
         return self.connect(credentials)
 
     def connect(self, credentials: list[WiFiCredentials]) -> bool:
-        """Attempt to connect to a WiFi network."""
-        if not self.validate_credentials(credentials):
+        """Attempt to connect to each network in turn; True on the first success."""
+        if not credentials or not self.validate_credentials(credentials):
             return False
 
+        timeout = int(configs.WIFI_CONNECT_TIMEOUT)
         for credential in credentials:
             logger.info(f"Attempting WiFi connection to SSID '{credential.ssid}'")
-            cmd = [
-                "nmcli",
-                "device",
-                "wifi",
-                "connect",
-                credential.ssid,
-            ]
+            cmd = ["nmcli", "--wait", str(timeout), "device", "wifi", "connect", credential.ssid]
             if credential.password:
-                cmd.extend([credential.password])
+                # nmcli needs the keyword: "connect <ssid> password <password>".
+                cmd += ["password", credential.password]
+            cmd += ["ifname", configs.HOTSPOT_INTERFACE]
 
-            try:
-                subprocess.run(cmd, check=True)
+            result = _run(cmd, timeout=timeout + 10)
+            if result is not None and result.returncode == 0:
+                logger.info(f"Connected to SSID '{credential.ssid}'")
                 return True
-            except subprocess.CalledProcessError:
-                logger.error(f"Error connecting to SSID: {credential.ssid}")
-                continue
+            detail = (result.stderr or result.stdout).strip() if result is not None else "nmcli unavailable"
+            logger.error(f"Error connecting to SSID '{credential.ssid}': {detail}")
         return False
 
     def start_hotspot(self) -> bool:
-        """Enable hotspot/access point mode for provisioning."""
-        logger.info("Starting hotspot mode for WiFi provisioning")
-        try:
-            subprocess.run([
-                "nmcli",
-                "device",
-                "wifi",
-                "hotspot",
-                "ifname",
-                "wlan0",
-                "ssid",
-                "MyPiSetup",
-                "password",
-                "raspberry123"
-            ])
-            return True
-        except subprocess.CalledProcessError:
-            logger.error(f"Error opening hotspot with SSID: MyPiSetup")
+        """Start the setup hotspot (HOTSPOT_SSID / HOTSPOT_PASSWORD from the config)."""
+        ssid, password = configs.HOTSPOT_SSID, configs.HOTSPOT_PASSWORD
+        if len(password) < 8:
+            logger.error("HOTSPOT_PASSWORD must be at least 8 characters (WPA2 requirement)")
             return False
+        logger.info("Starting setup hotspot '%s' on %s", ssid, configs.HOTSPOT_INTERFACE)
+        result = _run([
+            "nmcli", "device", "wifi", "hotspot",
+            "ifname", configs.HOTSPOT_INTERFACE,
+            "con-name", HOTSPOT_CONNECTION_NAME,
+            "ssid", ssid,
+            "password", password,
+        ], timeout=30)
+        if result is None or result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() if result is not None else "nmcli unavailable"
+            logger.error(f"Could not start hotspot '{ssid}': {detail}")
+            return False
+        return True
 
     def stop_hotspot(self) -> bool:
-        """Attempt to stop hotspot mode.
+        """Stop the setup hotspot only, leaving any other Wi-Fi connection alone.
 
-        The exact command used to stop a hotspot is platform-dependent. This
-        implementation uses `nmcli` to disconnect the wireless device. It is
-        a best-effort helper and may need adjustment for different systems.
+        (This used to disconnect the whole Wi-Fi device, which also dropped the
+        network the robot had just been given.)
         """
-        logger.info("Stopping hotspot mode")
-        try:
-            subprocess.run([
-                "nmcli",
-                "device",
-                "disconnect",
-                "wlan0"
-            ], check=True)
-            return True
-        except subprocess.CalledProcessError as exc:
-            logger.error(f"Error stopping hotspot: {exc}")
-            return False
-        except OSError as exc:
-            logger.error(f"Failed to stop hotspot (OS error): {exc}")
-            return False
-        
+        logger.info("Stopping setup hotspot")
+        result = _run(["nmcli", "connection", "down", HOTSPOT_CONNECTION_NAME], timeout=15)
+        # Fails harmlessly when the hotspot is already down (e.g. replaced by the new network).
+        return result is not None and result.returncode == 0
 
     def write_wpa_supplicant(self, credentials: WiFiCredentials) -> bool:
         """Write credentials to wpa_supplicant configuration.

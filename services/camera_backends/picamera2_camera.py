@@ -147,7 +147,9 @@ class Picamera2Backend(BaseCameraBackend):
             
             if configs.STREAMING_LOGS_ENABLED:
                 logger.debug("Frame validated: shape=%s dtype=%s", array.shape, array.dtype)
-            return array
+            # Picamera2's "RGB888" format stores pixels in B, G, R order (libcamera naming),
+            # so reverse the channels: everything downstream (model, JPEG) expects R, G, B.
+            return np.ascontiguousarray(array[:, :, ::-1])
             
         except CameraBackendError:
             raise

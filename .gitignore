@@ -12,3 +12,12 @@ wieghts/
 # Virtual environments
 .venv
 .env
+# Runtime files
+logs/
+services/logs
+output/
+models/*.tflite
+models/*.onnx
+models/*.json
+# Holds a Wi-Fi password; see config/wifi_credentials.example.json
+config/wifi_credentials.json

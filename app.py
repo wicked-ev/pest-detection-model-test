@@ -119,7 +119,9 @@ class RobotApplication:
         self._is_running = False
         self._last_housekeeping_ts = 0.0
         self._streaming_enabled = True
-        self._stream_commands_togglable = True
+        # Debug option: when True, "start_stream" on a running stream stops it (and vice versa).
+        # Off, because the dashboard sends start/stop and expects exactly that.
+        self._stream_commands_togglable = False
         
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
@@ -163,10 +165,6 @@ class RobotApplication:
                 logger.info("Shutdown requested during startup after network initialization")
                 self._rollback_startup()
                 return False
-
-            if self._provisioning_active:
-                logger.info("Provisioning mode is active; normal runtime startup is suspended")
-                return True
 
             if not self._startup_server():
                 self._rollback_startup()
@@ -222,13 +220,19 @@ class RobotApplication:
             return False
 
     def _startup_network(self) -> bool:
-        """Initialize network connectivity or enter provisioning mode."""
+        """Make sure the robot has a network, using the setup hotspot if needed.
+
+        Never fails startup: without a network the robot still runs (local detection,
+        motors) and the server connection is retried in the background.
+        """
         self.state_machine.transition_to(
             RobotState.WIFI_CONNECTING,
             reason="Connecting to WiFi",
         )
-        
-        # check if we already connected to wifi network
+        if not configs.WIFI_MANAGEMENT_ENABLED:
+            logger.info("WiFi management disabled; using the network the OS provides")
+            return True
+
         if self.wifi_manager.is_wifi_connected():
             logger.info("Already connected to Wifi network")
             return True
@@ -240,56 +244,59 @@ class RobotApplication:
             return True
 
         logger.info("No saved WiFi network available, entering provisioning mode")
-        if not self.hotspot_service.enter_provisioning_mode(stop_event=self._shutdown_requested):
-            logger.error("WiFi provisioning failed")
-            return False
-
+        self.state_machine.transition_to(RobotState.HOTSPOT_MODE, reason="WiFi provisioning")
+        self.state_machine.transition_to(RobotState.PROVISIONING, reason="Waiting for WiFi credentials")
         self._provisioning_active = True
-        self.state_machine.transition_to(
-            RobotState.HOTSPOT_MODE,
-            reason="WiFi provisioning active",
-        )
+        provisioned = self.hotspot_service.enter_provisioning_mode(stop_event=self._shutdown_requested)
+        self._provisioning_active = False
+        self.state_machine.transition_to(RobotState.WIFI_CONNECTING, reason="Provisioning finished")
+        if self._shutdown_requested.is_set():
+            return False
+        if provisioned:
+            logger.info("WiFi provisioned; continuing startup")
+        else:
+            logger.error("WiFi provisioning failed; continuing without a network")
         return True
 
     def _startup_server(self) -> bool:
-        """Establish connection to the remote control server."""
+        """Start the server connection; startup goes on even if the server is not reachable yet."""
         self.state_machine.transition_to(
             RobotState.SERVER_CONNECTING,
             reason="Connecting to remote server",
         )
-
-        if not self.network_service.connect_to_server(
+        connected = self.network_service.connect_to_server(
             stop_event=self._shutdown_requested,
             robot_id=getattr(configs, "ROBOT_ID", None),
             state_provider=lambda: self.state_machine.get_current_state().value,
-        ):
-            logger.error("Remote server connection failed")
-            return False
-
-        logger.info("Connected to remote control server")
+        )
+        if connected:
+            logger.info("Connected to remote control server")
         self.lifecycle_manager.register("network", self.network_service.disconnect)
-        return True
+        return not self._shutdown_requested.is_set()
 
     def _startup_hardware(self) -> bool:
-        """Initialize Arduino and motor hardware."""
-        self.arduino = ArduinoConnection(
+        """Connect the Arduino motor board. Without it the robot runs, but cannot move."""
+        if not configs.ARDUINO_ENABLED:
+            logger.warning("Arduino disabled (ARDUINO_ENABLED=false): movement commands will be ignored")
+            return True
+
+        arduino = ArduinoConnection(
             port=configs.ARDUINO_PORT,
             baudrate=configs.ARDUINO_BAUDRATE,
             timeout=configs.ARDUINO_TIMEOUT,
             write_timeout=configs.ARDUINO_WRITE_TIMEOUT,
         )
-
-        if not self.arduino.connect():
-            logger.error("Arduino connection failed")
-            return False
-
+        if not arduino.connect():
+            logger.error("Arduino not connected on %s: continuing without motors", configs.ARDUINO_PORT)
+            return True
+        self.arduino = arduino
         self.lifecycle_manager.register("arduino", self.arduino.disconnect)
 
-        self.motors = MotorController(self.arduino)
-        if not self.motors.initialize():
-            logger.error("Motor controller initialization failed")
-            return False
-
+        motors = MotorController(self.arduino)
+        if not motors.initialize():
+            logger.error("Motor controller initialization failed: continuing without motors")
+            return True
+        self.motors = motors
         self.lifecycle_manager.register("motors", self._cleanup_motors)
         return True
 
@@ -304,89 +311,95 @@ class RobotApplication:
         return False
 
     def _startup_services(self) -> bool:
-        """Start camera, model, and watchdog services."""
+        """Start the camera and detection. Problems are logged and retried, not fatal."""
         self.state_machine.transition_to(
             RobotState.CHECKING_SYSTEMS,
             reason="Starting services and health checks",
         )
 
         try:
-            # Ensure model assets are present and valid before starting services
-            logger.info("Checking model assets before service startup")
-            remote_fallback = False
-            if not self.asset_manager.ensure_assets(stop_event=self._shutdown_requested):
-                logger.warning("Required model assets are missing or invalid; enabling remote fallback streaming")
-                remote_fallback = True
-
-            if self._startup_cancelled("asset validation"):
-                return False
-
             self.camera_service.start()
-            if not self.camera_service.wait_for_first_frame(timeout=60.0, stop_event=self._shutdown_requested):
-                backend_name = self.camera_service._backend.name if self.camera_service._backend else "None"
-                logger.error("Camera failed to provide a first frame (backend=%s, opened=%s)",
-                           backend_name, self.camera_service._opened)
-                return False
             self.lifecycle_manager.register("camera", self.camera_service.stop)
+            if not self.camera_service.wait_for_first_frame(timeout=60.0, stop_event=self._shutdown_requested):
+                if self._startup_cancelled("camera startup"):
+                    return False
+                # The capture thread keeps retrying, and the watchdog restarts it if needed.
+                logger.error("Camera gave no frame yet; detection starts once frames arrive")
+            else:
+                self.health_service.check_camera(
+                    lambda: self.camera_service.get_latest(copy=False) is not None
+                )
 
             if self._startup_cancelled("camera startup"):
                 return False
 
-            camera_check = self.health_service.check_camera(
-                lambda: self.camera_service.get_latest(copy=False) is not None
-            )
-            if camera_check.status != HealthCheckStatus.OK:
-                logger.error("Camera health check failed")
-                return False
+            if not self._start_detection():
+                logger.error("Detection is not running (see errors above)")
+            self.lifecycle_manager.register("model", self.model_service.stop_streaming)
 
-            if self._startup_cancelled("camera health check"):
-                return False
-
-            # Try to load local model unless remote fallback explicitly requested
-            if not remote_fallback:
-                if not self.model_service.load_model():
-                    logger.warning("Local model load failed; attempting remote fallback if available")
-                else:
-                    if self._startup_cancelled("model loading"):
-                        return False
-                    model_check = self.health_service.check_ai_model(
-                        str(self.model_service.model_path),
-                        self.model_service.load_model,
-                    )
-                    if model_check.status != HealthCheckStatus.OK:
-                        logger.warning("AI model health check failed; will attempt remote fallback")
-                    else:
-                        # Local model available and healthy
-                        self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
-                        self.lifecycle_manager.register("model", self.model_service.stop_streaming)
-
-            if self._startup_cancelled("model startup"):
-                return False
-
-            # If no local model was started, attempt remote streaming to server
-            if not self.model_service.is_streaming():
-                if self.network_service.is_connected():
-                    try:
-                        logger.info("Starting remote frame streaming to server (fallback mode)")
-                        self.model_service.start_remote_streaming(self.camera_service, self.network_service, throttle_fps=configs.TARGET_FPS)
-                        self.lifecycle_manager.register("model", self.model_service.stop_streaming)
-                    except Exception as exc:
-                        logger.error(f"Failed to start remote fallback streaming: {exc}")
-                        return False
-                else:
-                    logger.error("No model available and network server is not connected for fallback")
-                    return False
-
-            if self._startup_cancelled("stream startup"):
+            if self._startup_cancelled("detection startup"):
                 return False
 
             self._register_watchdog_targets()
             self.lifecycle_manager.register("watchdog", self.watchdog_service.stop)
-
             return True
         except Exception as exc:
-            logger.error(f"Service startup failed: {exc}")
+            logger.error(f"Service startup failed: {exc}", exc_info=True)
             return False
+
+    def _start_detection(self) -> bool:
+        """Run detection on the robot if possible, otherwise on the server.
+
+        DETECTION_MODE "auto": local model if a runtime and model are available, else server.
+        "local": local only. "server": always the server.
+        With a local model, frames and results still go to the server for monitoring.
+        """
+        mode = configs.DETECTION_MODE
+        if mode != "server" and self._start_local_detection():
+            self.model_service.start_frame_streaming(
+                self.camera_service, self.network_service, fps=configs.STREAM_FPS, mode="monitor"
+            )
+            logger.info("Detection runs on the robot; frames and results are sent to the server for monitoring")
+            return True
+
+        if mode == "local":
+            logger.error("DETECTION_MODE=local but the local model could not start")
+            return False
+
+        if mode == "auto":
+            logger.warning("No usable local model; detection will run on the server")
+        self.model_service.start_frame_streaming(
+            self.camera_service, self.network_service, fps=configs.STREAM_FPS, mode="server"
+        )
+        logger.info("Streaming frames to the server for detection")
+        return True
+
+    def _start_local_detection(self) -> bool:
+        if not self.model_service.is_model_loaded():
+            # Check the runtime first: without one, downloading the model would be wasted.
+            if not self.model_service.has_runtime():
+                logger.warning(
+                    "No local inference runtime installed (%s)",
+                    ", ".join(self.model_service.backend_preference),
+                )
+                return False
+            logger.info("Checking local model assets")
+            if not self.asset_manager.ensure_assets(stop_event=self._shutdown_requested):
+                logger.warning("Local model files are missing or invalid")
+                return False
+            if not self.model_service.load_model():
+                logger.warning("No local inference runtime could load the model")
+                return False
+            self.health_service.check_ai_model(
+                str(self.model_service.model_path),
+                self.model_service.is_model_loaded,
+            )
+        try:
+            self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
+        except Exception as exc:
+            logger.warning(f"Local detection failed to start: {exc}")
+            return False
+        return self.model_service.is_local_streaming()
 
     def _enqueue_event(self, event_type: str, payload: Optional[object] = None) -> None:
         if self._shutdown_requested.is_set():
@@ -398,18 +411,11 @@ class RobotApplication:
             logger.warning(f"Processing emergency event: {payload}")
             self.shutdown()
         elif event_type == "detection":
-            logger.info("Processing detection event")
+            # The server already has these results: it computed them (server mode) or
+            # receives them on the stream (monitor mode), so nothing is sent back here.
             detections = payload if isinstance(payload, list) else []
-            self._send_telemetry({
-                "type": "detection",
-                "detections": detections,
-                "state": self.state_machine.get_current_state().value,
-            })
-            if self.state_machine.is_ready():
-                self.state_machine.transition_to(
-                    RobotState.DETECTING,
-                    reason="Object detected",
-                )
+            labels = sorted({str(d.get("class")) for d in detections if isinstance(d, dict)})
+            logger.info("Detected %d object(s): %s", len(detections), ", ".join(labels))
             return
         elif event_type == "diagnostics":
             self.print_diagnostics()
@@ -593,8 +599,8 @@ class RobotApplication:
         self._process_remote_command(payload)
 
     def _on_detection(self, detections: list) -> None:
-        logger.info("Detection callback received %d detections", len(detections))
-        self._enqueue_event("detection", detections)
+        if detections:
+            self._enqueue_event("detection", detections)
 
     def _process_remote_command(self, payload: object) -> None:
         if not isinstance(payload, dict):
@@ -702,37 +708,13 @@ class RobotApplication:
         logger.info("Stream stopped via remote command")
 
     def _start_model_streaming(self) -> bool:
-        """Start local inference streaming, falling back to remote streaming when needed."""
+        """Start detection after a remote "start_stream" (local if possible, else server)."""
         if self.model_service.is_streaming():
             return True
-
         if not self.camera_service.is_running():
             logger.warning("Camera service is not running; starting camera before stream activation")
             self.camera_service.start()
-            if not self.camera_service.wait_for_first_frame(timeout=60.0, stop_event=self._shutdown_requested):
-                logger.error("Camera failed to provide a frame after remote stream start request")
-                return False
-
-        try:
-            self.model_service.start_streaming(self.camera_service, throttle_fps=configs.TARGET_FPS)
-            return self.model_service.is_local_streaming()
-        except Exception as exc:
-            logger.warning(f"Local stream start failed, trying remote fallback: {exc}")
-
-        if not self.network_service.is_connected():
-            logger.error("Cannot start remote fallback streaming: network server is disconnected")
-            return False
-
-        try:
-            self.model_service.start_remote_streaming(
-                self.camera_service,
-                self.network_service,
-                throttle_fps=configs.TARGET_FPS,
-            )
-            return self.model_service.is_remote_streaming()
-        except Exception as exc:
-            logger.error(f"Remote fallback stream start failed: {exc}")
-            return False
+        return self._start_detection()
 
     def _perform_remote_reboot(self) -> None:
         """Shutdown services and re-exec the current Python process."""
@@ -822,12 +804,13 @@ class RobotApplication:
             recovery_fn=self._restart_model_service,
             critical=False,
         )
-        self.watchdog_service.register_target(
-            name="Arduino Connection",
-            check_fn=self._check_arduino_watchdog,
-            recovery_fn=self._restart_arduino_connection,
-            critical=True,
-        )
+        if self.arduino is not None:
+            self.watchdog_service.register_target(
+                name="Arduino Connection",
+                check_fn=self._check_arduino_watchdog,
+                recovery_fn=self._restart_arduino_connection,
+                critical=True,
+            )
         self.watchdog_service.start()
 
     def _check_camera_watchdog(self):
@@ -846,7 +829,8 @@ class RobotApplication:
         logger.warning("Watchdog attempting camera recovery")
         self.camera_service.stop()
         self.camera_service.start()
-        return self.camera_service.wait_for_first_frame(timeout=60.0)
+        # Short wait: this runs on the watchdog thread, which also watches the Arduino.
+        return self.camera_service.wait_for_first_frame(timeout=10.0)
 
     def _check_model_watchdog(self):
         if self._shutdown_requested.is_set() or self._shutdown_started:
@@ -859,6 +843,9 @@ class RobotApplication:
             return False, "Model streaming not running"
 
         if stream_mode == "remote":
+            if not self.network_service.is_stream_connected():
+                # Frames are only sent while connected; the connection retries by itself.
+                return True, "Waiting for the server connection"
             age = self.model_service.get_last_remote_activity_age()
             if age is None:
                 return False, "No remote frame transmission yet"
@@ -878,23 +865,9 @@ class RobotApplication:
             logger.info("Skipping model watchdog recovery because streaming is intentionally paused")
             return True
 
-        logger.warning("Watchdog attempting model recovery")
-        stream_mode = self.model_service.get_stream_mode()
-
-        if stream_mode == "remote":
-            if not self.network_service.is_connected():
-                logger.error("Cannot recover remote fallback streaming: network server is disconnected")
-                return False
-
-            self.model_service.stop_streaming()
-            self.model_service.start_remote_streaming(
-                self.camera_service,
-                self.network_service,
-                throttle_fps=configs.TARGET_FPS,
-            )
-            return self.model_service.is_remote_streaming()
-
-        return self._start_model_streaming()
+        logger.warning("Watchdog attempting detection recovery")
+        self.model_service.stop_streaming()
+        return self._start_detection()
 
     def _check_arduino_watchdog(self):
         if self._shutdown_requested.is_set() or self._shutdown_started:
@@ -922,10 +895,11 @@ class RobotApplication:
         if self._shutdown_requested.is_set() or self._shutdown_started:
             logger.debug(f"Ignoring watchdog failure for {target_name} during shutdown/reboot: {message}")
             return
-        logger.critical(f"Watchdog failure for {target_name}: {message}")
-        self.emergency_service.engage(
-            f"Watchdog failure ({target_name}): {message}"
-        )
+        # Stop moving (it is unsafe to drive blind or without motor feedback) but keep the
+        # program running: the watchdog keeps trying to recover, and the robot stays
+        # reachable from the dashboard. Exiting would need someone to restart it by hand.
+        logger.critical(f"Watchdog failure for {target_name}: {message}; stopping movement")
+        self._stop_all_movement(f"watchdog failure ({target_name})")
 
     def _stop_all_movement(self, reason: Optional[str] = None) -> None:
         if reason:

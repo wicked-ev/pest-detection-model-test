@@ -46,13 +46,13 @@ class CameraConfig:
     Internally, it uses the CameraBackendConfig from the new architecture.
     """
     device: int = configs.CAMERA_DEVICE
-    width: int = 640
-    height: int = 480
-    fps: int = 30
+    width: int = configs.CAMERA_WIDTH
+    height: int = configs.CAMERA_HEIGHT
+    fps: int = configs.CAMERA_FPS
     buffer_size: int = 2
     frame_format: str = "rgb"
     read_timeout: float = 3.0
-    backend_preference: Optional[Tuple[str, ...]] = None
+    backend_preference: Optional[Tuple[str, ...]] = configs.CAMERA_BACKENDS
     cache_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
