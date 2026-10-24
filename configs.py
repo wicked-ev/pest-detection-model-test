@@ -173,7 +173,9 @@ SERVER_HOST = _host_env if _host_env.strip() else "localhost"
 _port_env = os.getenv("SERVER_PORT", "8000")
 SERVER_PORT = int(_port_env) if _port_env.strip() else 8000
 SERVER_URL = f"{SERVER_HOST}:{SERVER_PORT}"
-ROBOT_ID = os.getenv("ROBOT_ID", socket.gethostname())
+# Empty counts as unset: an empty ID made the server URL end in "/ws/control/", which the
+# server rejects (HTTP 403, same as a wrong key).
+ROBOT_ID = os.getenv("ROBOT_ID", "").strip() or socket.gethostname()
 # Shared secret the server requires on the robot's websockets (must match the server's ROBOT_KEY).
 ROBOT_KEY = os.getenv("ROBOT_KEY", "").strip()
 

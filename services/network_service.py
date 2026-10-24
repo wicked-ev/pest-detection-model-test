@@ -454,8 +454,9 @@ class NetworkService:
         text = str(exc)
         if "403" in text:
             logger.error(
-                "%s connection rejected by the server (HTTP 403): "
-                "ROBOT_KEY in .env must match the server's ROBOT_KEY",
+                "%s connection rejected by the server (HTTP 403). Usually ROBOT_KEY in .env does not "
+                "match the server's ROBOT_KEY (the server then logs 'bad or missing robot key'); "
+                "otherwise check SERVER_HOST/SERVER_PORT point at this project's server",
                 kind,
             )
         else:
